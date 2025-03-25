@@ -1,5 +1,5 @@
 use crate::helpers::{CoordType, Point, Rect, Size};
-use crate::{helpers, ucd};
+use crate::{helpers, sys, ucd};
 use std::fmt::Write;
 
 pub enum IndexedColor {
@@ -465,8 +465,7 @@ impl Framebuffer {
     }
 
     pub fn render(&mut self) -> String {
-        let mut result = String::new();
-        result.push_str("\x1b[H");
+        sys::move_cursor(0, 0);
 
         let mut last_bg = self.bg_bitmap[0];
         let mut last_fg = self.fg_bitmap[0];
@@ -476,7 +475,7 @@ impl Framebuffer {
 
         for y in 0..self.size.height {
             if y != 0 {
-                result.push_str("\r\n");
+                sys::write_stdout("\r\n");
             }
 
             let line = &self.lines[y as usize][..];
@@ -493,57 +492,34 @@ impl Framebuffer {
                 if x != 0 {
                     let beg = cfg.cursor().offset;
                     let end = cfg.goto_visual(Point { x, y: 0 }).offset;
-                    result.push_str(&line[beg..end]);
+                    sys::write_stdout(&line[beg..end]);
                 }
 
                 if last_bg != bg {
                     last_bg = bg;
-
-                    if bg == self.indexed(IndexedColor::DefaultBackground) {
-                        result.push_str("\x1b[49m");
-                    } else {
-                        _ = write!(
-                            result,
-                            "\x1b[48;2;{};{};{}m",
-                            bg & 0xff,
-                            (bg >> 8) & 0xff,
-                            (bg >> 16) & 0xff
-                        );
-                    }
+                    sys::set_color(last_fg, last_bg);
                 }
 
                 if last_fg != fg {
                     last_fg = fg;
-                    _ = write!(
-                        result,
-                        "\x1b[38;2;{};{};{}m",
-                        fg & 0xff,
-                        (fg >> 8) & 0xff,
-                        (fg >> 16) & 0xff
-                    );
+                    sys::set_color(last_fg, last_bg);
                 }
             }
 
-            result.push_str(&line[cfg.cursor().offset..]);
+            sys::write_stdout(&line[cfg.cursor().offset..]);
         }
 
         if self.cursor.x >= 0 && self.cursor.y >= 0 {
             // CUP to the cursor position.
             // DECSCUSR to set the cursor style.
             // DECTCEM to show the cursor.
-            _ = write!(
-                result,
-                "\x1b[{};{}H\x1b[{} q\x1b[?25h",
-                self.cursor.y + 1,
-                self.cursor.x + 1,
-                if self.cursor_overtype { 1 } else { 5 }
-            );
+            sys::move_cursor(self.cursor.x as usize, self.cursor.y as usize);
         } else {
             // DECTCEM to hide the cursor.
-            result.push_str("\x1b[?25l");
+            //result.push_str("\x1b[?25l");
         }
 
-        result
+        "".to_string()
     }
 }
 

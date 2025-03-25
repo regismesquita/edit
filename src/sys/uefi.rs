@@ -1,0 +1,334 @@
+use crate::apperr;
+use crate::helpers::Size;
+use crate::input::{Input, InputKey};
+use std::alloc::{alloc, dealloc, Layout};
+use std::ffi::{c_int, c_void, CStr, OsString};
+use std::fmt::Write;
+use std::fs::File;
+use std::ptr::NonNull;
+//use std::os::uefi::ffi::OsStrExt;
+use r_efi::efi;
+use r_efi::efi::Status;
+use uefi::proto::console::text::{Color, OutputMode};
+//use r_efi::protocols::simple_text_output;
+use uefi::{CStr16, Char16, Handle, ResultExt};
+use uefi::system;
+extern crate alloc;
+use std::os::uefi as uefi_std;
+//use std::os::uefi::env;
+use std::time;
+use qemu_exit::QEMUExit;
+
+/*
+pub enum Input<'input> {
+    Resize(Size),
+    Keyboard(InputKey),
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct InputKey(u32);
+
+impl InputKey {
+    pub const fn new(v: u32) -> Self {
+        Self(v)
+    }
+
+    pub const fn value(&self) -> u32 {
+        self.0
+    }
+
+    pub const fn key(&self) -> InputKey {
+        InputKey(self.0 & 0x00FFFFFF)
+    }
+
+    pub const fn modifiers(&self) -> InputKeyMod {
+        InputKeyMod(self.0 & 0xFF000000)
+    }
+
+    pub const fn modifiers_contains(&self, modifier: InputKeyMod) -> bool {
+        (self.0 & modifier.0) != 0
+    }
+
+    pub const fn with_modifiers(&self, modifiers: InputKeyMod) -> InputKey {
+        InputKey(self.0 | modifiers.0)
+    }
+}
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct InputKeyMod(u32);
+
+impl InputKeyMod {
+    const fn new(v: u32) -> Self {
+        Self(v)
+    }
+
+    pub const fn contains(&self, modifier: InputKeyMod) -> bool {
+        (self.0 & modifier.0) != 0
+    }
+}
+*/
+
+pub fn preferred_languages() -> Vec<String> {
+    return ["en"].iter().map(|s| s.to_string()).collect();
+}
+
+pub fn init() -> apperr::Result<()> {
+    let st = uefi_std::env::system_table();
+    let ih = uefi_std::env::image_handle();
+
+    // Mandatory setup code for `uefi` crate.
+    unsafe {
+        uefi::table::set_system_table(st.as_ptr().cast());
+
+        let ih = Handle::from_ptr(ih.as_ptr().cast()).unwrap();
+        uefi::boot::set_image_handle(ih);
+    }
+    let qemu_exit_handle = qemu_exit::X86::new(0xf4, 0x1);
+
+    uefi::helpers::init().unwrap();
+
+    //let u = CString16::try_from("hello world\r\n").unwrap();
+    //let _ = uefi::system::with_stdout(|o| o.output_string(&u));;
+    write_stdout("Bootstrap done\r\n");
+
+    uefi::system::with_stdout(|o| {
+        let m = o.modes().last();
+        if m.is_some() {
+            o.set_mode(m.unwrap());
+        }
+    });
+
+    Ok({})
+}
+
+pub fn deinit() {
+    uefi::boot::stall(10_000_000);
+}
+
+pub fn inject_window_size_into_stdin() {
+    unsafe {
+        STATE.inject_resize = true;
+    }
+}
+
+fn get_window_size() -> (u16, u16) {
+    match uefi::system::with_stdout(|o| o.current_mode().unwrap()) {
+        Some(t) => {
+            ((t.columns() - 1) as u16, t.rows() as u16)
+        }
+        None => {
+            (80, 25)
+        }
+    }
+}
+
+struct State {
+    utf8_buf: [u8; 4],
+    utf8_len: usize,
+    inject_resize: bool,
+}
+
+static mut STATE: State = State {
+    utf8_buf: [0; 4],
+    utf8_len: 0,
+    inject_resize: false,
+};
+
+/// Reads from stdin.
+///
+/// Returns `None` if there was an error reading from stdin.
+/// Returns `Some("")` if the given timeout was reached.
+/// Otherwise, it returns the read, non-empty string.
+pub fn read_stdin(timeout: time::Duration) -> Option<String> {
+    unsafe {
+        if (STATE.inject_resize) {
+            STATE.inject_resize = false;
+            Some("\x1b[8;25;80t".to_owned())
+        } else {
+            Some("".to_owned())
+        }
+    }
+}
+
+pub fn read_input() -> Option<Input<'static>> {
+    unsafe {
+        if (STATE.inject_resize) {
+            STATE.inject_resize = false;
+            let t = get_window_size();
+            Some(Input::Resize(Size{width: t.0 as i32, height:t.1 as i32}))
+        } else {
+            uefi::system::with_stdin(|i| {
+                let mut events = [i.wait_for_key_event().unwrap()];
+                uefi::boot::wait_for_event(&mut events).discard_errdata().ok()?;
+                match i.read_key().ok()? {
+                    Some(uefi::proto::console::text::Key::Printable(k)) => {
+                        let mut v: u16 = k.try_into().ok()?;
+                        v = v & !0x20;
+                        Some(Input::Keyboard(InputKey::new(v as u32)))
+                    },
+                    Some(uefi::proto::console::text::Key::Special(sc)) => {
+                        println!("got scancode...");
+                        Some(Input::Keyboard(InputKey::new(sc.0 as u32)))
+                    },
+                    _ => None
+                }
+            })
+        }
+    }
+}
+
+static RGB_FG_INDEX: &'static [u8] = &[
+     0,  1,  1,  9,  0,  0,  1,  1,  2,  1,  1,  1,  2,  8,  1,  9,
+     2,  2,  3,  3,  2,  2, 11,  3, 10, 10, 11, 11, 10, 10, 10, 11,
+     0,  5,  1,  1,  0,  0,  1,  1,  8,  1,  1,  1,  2,  8,  1,  9,
+     2,  2,  3,  3,  2,  2, 11,  3, 10, 10, 10, 11, 10, 10, 10, 11,
+     5,  5,  5,  1,  4,  5,  1,  1,  8,  8,  1,  9,  2,  8,  9,  9,
+     2,  2,  3,  3,  2,  2, 11,  3, 10, 10, 11, 11, 10, 10, 10, 11,
+     4,  5,  5,  1,  4,  5,  5,  1,  8,  5,  5,  1,  8,  8,  9,  9,
+     2,  2,  8,  9, 10,  2, 11,  3, 10, 10, 11, 11, 10, 10, 10, 11,
+     4, 13,  5,  5,  4, 13,  5,  5,  4, 13, 13, 13,  6,  8, 13,  9,
+     6,  8,  8,  9, 10, 10, 11,  3, 10, 10, 11, 11, 10, 10, 10, 11,
+     4, 13, 13, 13,  4, 13, 13, 13,  4, 12, 13, 13,  6, 12, 13, 13,
+     6,  6,  8,  9,  6,  6,  7,  7, 10, 14, 14,  7, 10, 10, 14, 11,
+     4, 12, 13, 13,  4, 12, 13, 13,  4, 12, 13, 13,  6, 12, 12, 13,
+     6,  6, 12,  7,  6,  6,  7,  7,  6, 14, 14,  7, 14, 14, 14, 15,
+    12, 12, 13, 13, 12, 12, 13, 13, 12, 12, 12, 13, 12, 12, 12, 13,
+     6, 12, 12,  7,  6,  6,  7,  7,  6, 14, 14,  7, 14, 14, 14, 15
+];
+
+pub fn move_cursor(x: usize, y: usize) {
+    uefi::system::with_stdout(|o| o.set_cursor_position(x, y));
+}
+
+pub fn color_to_index(color: u32) -> u8 {
+    // ooBBGGRR
+    let r = (color & 0xFF) as u8;
+    let g = ((color & 0xFF00) >> 8) as u8;
+    let b = ((color & 0xFFFF00) >> 16) as u8;
+    let crgb = (r & 0b11100000) | ((g >> 3) & 0b11100) | ((b >> 6) & 0b11);
+    RGB_FG_INDEX[crgb as usize]
+}
+
+pub fn index_to_uefi(index: u8) -> Color {
+    /*
+    let obs = (index ^ (index >> 2)) & 1;
+    index = index ^ obs ^ (obs << 2);
+    */
+    unsafe { std::mem::transmute::<_, Color>(index) }
+}
+
+pub fn set_color(fg: u32, bg: u32) {
+    let b = color_to_index(bg) & 0b111; // cut off intensity flag
+    let f = color_to_index(fg);
+    uefi::system::with_stdout(|o| o.set_color(index_to_uefi(f), index_to_uefi(b)));
+}
+
+pub fn write_stdout(text: &str) {
+  // Use System Table Directly
+  /*
+  let st = env::system_table().as_ptr() as *mut efi::SystemTable;
+  let mut s: Vec<u16> = OsString::from(text).encode_wide().collect();
+  s.push(0);
+  let r =
+      unsafe {
+        let con_out: *mut simple_text_output::Protocol = (*st).con_out;
+        let output_string: extern "efiapi" fn(_: *mut simple_text_output::Protocol, *mut u16) -> efi::Status = (*con_out).output_string;
+        output_string(con_out, s.as_ptr() as *mut efi::Char16)
+      };
+      */
+    //let u = CString16::try_from(text).unwrap();
+    //let _ = uefi::system::with_stdout(|o| o.output_string(&u));;
+    match uefi::system::with_stdout(|o| o.write_str(text)) {
+        Ok(t) => _ = t,
+        _ => unreachable!()
+    }
+    /*
+    let buf = text.as_bytes();
+    let mut written = 0;
+
+    while written < buf.len() {
+        let w = &buf[written..];
+        let n = unsafe { libc::write(STATE.stdout, w.as_ptr() as *const _, w.len()) };
+
+        if n >= 0 {
+            written += n as usize;
+            continue;
+        }
+
+        let err = unsafe { *libc::__errno_location() };
+        if err != libc::EINTR {
+            return;
+        }
+    }
+    */
+}
+
+pub fn open_stdin_if_redirected() -> Option<File> {
+    // This platform does not support redirection
+    None
+}
+
+pub unsafe fn virtual_reserve(size: usize) -> apperr::Result<*mut u8> {
+    unsafe {
+        let ptr= uefi::boot::allocate_pool(uefi::boot::MemoryType::BOOT_SERVICES_DATA, size).unwrap();
+        Ok(ptr.as_ptr())
+        /*
+        let ptr = alloc(Layout::from_size_align(size, 8).unwrap_unchecked());
+        if ptr.is_null() {
+            Err(apperr::Error::new(efi::Status::BAD_BUFFER_SIZE.as_usize() as u32))
+        } else {
+            Ok(ptr)
+        } */
+    }
+}
+
+pub unsafe fn virtual_release(base: *mut u8, size: usize) {
+    if !base.is_null() {
+        unsafe {
+            let _ = uefi::boot::free_pool(NonNull::new_unchecked(base)).unwrap();
+            //dealloc(base, Layout::from_size_align(size, 8).unwrap_unchecked());
+        }
+    }
+}
+
+pub unsafe fn virtual_commit(base: *mut u8, size: usize) -> apperr::Result<()> { unsafe {
+    Ok({})
+}}
+
+// It'd be nice to constrain T to std::marker::FnPtr, but that's unstable.
+pub fn get_proc_address<T>(handle: *mut c_void, name: &CStr) -> apperr::Result<T> { unsafe {
+    Err(apperr::Error::new(efi::Status::NOT_FOUND.as_usize() as u32))
+}}
+
+pub fn load_icu() -> apperr::Result<*mut c_void> { unsafe {
+    Err(apperr::Error::new(efi::Status::NOT_FOUND.as_usize() as u32))
+}}
+
+#[inline]
+pub fn io_error_to_apperr(err: std::io::Error) -> apperr::Error {
+    unsafe { apperr::Error::new((err.raw_os_error().unwrap_or((err.kind() as usize)|0xFF00) as u32).max(1)) }
+}
+
+pub fn format_error(err: apperr::Error) -> String {
+    let errno = err.value() & 0xFFFF;
+    let result = format!("Error {:x}", errno);
+
+    result
+}
+
+fn errno_to_apperr(no: c_int) -> apperr::Error {
+    unsafe { apperr::Error::new(no.max(1) as u32) }
+}
+
+/*
+fn check_int_return(ret: libc::c_int) -> apperr::Result<libc::c_int> {
+    if ret < 0 {
+        Err(errno_to_apperr(unsafe { *libc::__errno_location() }))
+    } else {
+        Ok(ret)
+    }
+}
+
+
+*/

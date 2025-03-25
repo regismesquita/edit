@@ -3,7 +3,7 @@ use crate::framebuffer::{Framebuffer, INDEXED_COLORS_COUNT, IndexedColor};
 use crate::helpers::{CoordType, Point, Rect, Size, hash, hash_str, wymix};
 use crate::input::{InputKeyMod, kbmod, vk};
 use crate::ucd::Document;
-use crate::{helpers, input, trust_me_bro, ucd};
+use crate::{helpers, input, sys, trust_me_bro, ucd};
 use std::fmt::Write as _;
 use std::iter;
 use std::mem;
@@ -59,9 +59,6 @@ pub struct Tui {
     /// Last known mouse state.
     mouse_state: InputMouseState,
     mouse_gesture: InputMouseGesture,
-    last_click: std::time::Instant,
-    last_click_target: u64,
-    last_click_position: Point,
 
     clipboard: Vec<u8>,
     cached_text_buffers: Vec<CachedTextBuffer>,
@@ -93,9 +90,6 @@ impl Tui {
             mouse_down_position: Point::MIN,
             mouse_state: InputMouseState::None,
             mouse_gesture: InputMouseGesture::None,
-            last_click: std::time::Instant::now(),
-            last_click_target: 0,
-            last_click_position: Point::MIN,
 
             clipboard: Vec::new(),
             cached_text_buffers: Vec::with_capacity(16),
@@ -154,7 +148,6 @@ impl Tui {
             self.needs_more_settling();
         }
 
-        let now = std::time::Instant::now();
         let mut input_text = None;
         let mut input_keyboard = None;
         let mut input_mouse_modifiers = kbmod::NONE;
@@ -184,85 +177,8 @@ impl Tui {
             Some(input::Input::Keyboard(keyboard)) => {
                 input_keyboard = Some(keyboard);
             }
-            Some(input::Input::Mouse(mouse)) => {
-                let mut next_state = mouse.state;
-                let next_position = mouse.position;
-                let next_scroll = mouse.scroll;
+            Some(input::Input::Mouse(_)) => {
 
-                let mut hovered_node = null();
-                let mut focused_node = null();
-
-                for root in self.prev_tree.iterate_roots() {
-                    Tree::visit_all(root, root, 0, true, |_, node| {
-                        if !node.outer_clipped.contains(next_position) {
-                            // Skip the entire sub-tree, because it doesn't contain the cursor.
-                            return VisitControl::SkipChildren;
-                        }
-                        hovered_node = node;
-                        if node.attributes.focusable {
-                            focused_node = node;
-                        }
-                        VisitControl::Continue
-                    });
-                }
-
-                Self::build_node_path(
-                    unsafe { hovered_node.as_ref() },
-                    &mut self.hovered_node_path,
-                );
-
-                if self.mouse_state != InputMouseState::None && next_state == InputMouseState::None
-                {
-                    // When the input transitions from some mouse input to no mouse input,
-                    // we'll emit 1 InputMouseAction::Release event.
-                    next_state = InputMouseState::Release;
-                } else if self.mouse_state == InputMouseState::None
-                    && next_state == InputMouseState::Left
-                {
-                    // On left-mouse-down we change focus.
-                    Self::build_node_path(
-                        unsafe { focused_node.as_ref() },
-                        &mut self.focused_node_path,
-                    );
-                    self.mouse_down_position = next_position;
-                    self.needs_more_settling(); // See `needs_more_settling()`.
-                }
-
-                let next_gesture = if next_state == InputMouseState::Release
-                    && next_position == self.mouse_position
-                {
-                    // Mouse down and up happened at the same position = Click.
-                    // TODO: This should instead check if the focus stack is the same as on mouse-down.
-                    // TODO: This should check if the last action was a Click as well (and not keyboard input).
-                    let click_target = unsafe { focused_node.as_ref() }.map(|n| n.id).unwrap_or(0);
-                    let action = if (now - self.last_click) <= std::time::Duration::from_millis(500)
-                        && click_target == self.last_click_target
-                        && next_position == self.last_click_position
-                    {
-                        InputMouseGesture::DoubleClick
-                    } else {
-                        InputMouseGesture::Click
-                    };
-                    self.last_click = now;
-                    self.last_click_target = click_target;
-                    self.last_click_position = next_position;
-                    action
-                } else if self.mouse_state == InputMouseState::Left
-                    && next_state == InputMouseState::Left
-                    && next_position != self.mouse_position
-                {
-                    // Mouse down and moved = Drag.
-                    InputMouseGesture::Drag
-                } else {
-                    InputMouseGesture::None
-                };
-
-                input_mouse_modifiers = mouse.modifiers;
-                input_mouse_gesture = next_gesture;
-                input_scroll_delta = next_scroll;
-                self.mouse_position = next_position;
-                self.mouse_state = next_state;
-                self.mouse_gesture = next_gesture;
             }
         }
 
@@ -275,7 +191,6 @@ impl Tui {
         Context {
             tui: self,
 
-            now,
             input_text,
             input_keyboard,
             input_mouse_modifiers,
@@ -981,7 +896,6 @@ impl Tui {
 pub struct Context<'tui, 'input> {
     tui: &'tui mut Tui,
 
-    now: std::time::Instant,
     /// Current text input, if any.
     input_text: Option<InputText<'input>>,
     /// Current keyboard input, if any.
@@ -2211,7 +2125,7 @@ impl Context<'_, '_> {
         self.attr_focusable();
         self.attr_padding(Rect::two(0, 1));
 
-        if self.consume_shortcut(kbmod::ALT | InputKey::new(accelerator as u32)) {
+        if self.consume_shortcut(/*kbmod::ALT | */InputKey::new(accelerator as u32)) {
             self.steal_focus();
         }
 

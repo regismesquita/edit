@@ -1,3 +1,5 @@
+#![feature(uefi_std)]
+
 // TODO:
 // * Find & Replace doesn't find all matches.
 // * Find & Replace All, followed by Ctrl+Z breaks the buffer.
@@ -26,7 +28,7 @@
 )]
 
 use buffer::RcTextBuffer;
-use helpers::{COORD_TYPE_SAFE_MAX, DisplayablePathBuf};
+use helpers::{DisplayableCString, DisplayablePathBuf, Point, COORD_TYPE_SAFE_MAX};
 use input::{kbmod, vk};
 
 use crate::framebuffer::IndexedColor;
@@ -34,6 +36,7 @@ use crate::helpers::{Rect, Size};
 use crate::loc::{LocId, loc};
 use crate::tui::*;
 use crate::vt::Token;
+use std::ffi::CString;
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 use std::{cmp, process};
@@ -165,6 +168,7 @@ impl State {
 }
 
 fn main() -> process::ExitCode {
+    /*
     if cfg!(debug_assertions) {
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
@@ -173,6 +177,7 @@ fn main() -> process::ExitCode {
             hook(info);
         }));
     }
+    */
 
     let code = match run() {
         Ok(()) => process::ExitCode::SUCCESS,
@@ -213,28 +218,30 @@ fn run() -> apperr::Result<()> {
     }
 
     let _restore_modes = set_modes();
-    query_color_palette(&mut tui, &mut vt_parser);
     sys::inject_window_size_into_stdin();
 
     loop {
+        /*
         let read_timeout = vt_parser.read_timeout().min(tui.read_timeout());
         let Some(input) = sys::read_stdin(read_timeout) else {
             break;
         };
+        */
 
         #[cfg(feature = "debug-latency")]
         let time_beg = std::time::Instant::now();
         #[cfg(feature = "debug-latency")]
         let mut passes = 0usize;
 
+        /*
         // TODO: lifetime
         let vt_iter = vt_parser.parse(trust_me_bro::this_lifetime_change_is_totally_safe(&input));
         let mut input_iter = input_parser.parse(vt_iter);
+        */
 
         // Process all input.
-        while {
-            let input = input_iter.next();
-            let more = input.is_some();
+        {
+            let input = sys::read_input();
             let mut ctx = tui.create_context(input);
 
             draw(&mut ctx, &mut state);
@@ -243,9 +250,7 @@ fn run() -> apperr::Result<()> {
             {
                 passes += 1;
             }
-
-            more
-        } {}
+        }
 
         // Continue rendering until the layout has settled.
         // This can take >1 frame, if the input focus is tossed between different controls.
@@ -1103,6 +1108,24 @@ fn draw_handle_save_impl(ctx: &mut Context, state: &mut State, path: Option<&Pat
     true
 }
 
+static mut ENCODINGS: Option<Vec<DisplayableCString>> = None;
+pub fn get_available_encodings() -> &'static [DisplayableCString] {
+    // OnceCell for people that want to put it into a static.
+    #[allow(static_mut_refs)]
+    unsafe {
+        if ENCODINGS.is_none() {
+            let mut encodings = Vec::new();
+
+            if encodings.is_empty() {
+                encodings.push(DisplayableCString::new(CString::new("UTF-8").unwrap()));
+            }
+
+            ENCODINGS = Some(encodings);
+        }
+        ENCODINGS.as_ref().unwrap_unchecked().as_slice()
+    }
+}
+
 fn draw_dialog_encoding_change(ctx: &mut Context, state: &mut State) {
     let reopen = state.wants_encoding_change == StateEncodingChange::Reopen;
     let width = (ctx.size().width - 20).max(10);
@@ -1121,7 +1144,7 @@ fn draw_dialog_encoding_change(ctx: &mut Context, state: &mut State) {
         ctx.inherit_focus();
         ctx.attr_background_rgba(ctx.indexed(IndexedColor::Cyan));
         {
-            let encodings = icu::get_available_encodings();
+            let encodings = get_available_encodings();
 
             ctx.list_begin("encodings");
             ctx.inherit_focus();

@@ -16,6 +16,11 @@ debug-assertions = true # Temporary while I test this
 
 [dependencies]
 
+[target.'cfg(target_os = "uefi")'.dependencies]
+uefi = { version = "0.34.1", features = [ "alloc", "global_allocator", "logger", "log-debugcon" ] }
+qemu-exit = { version = "3.0.2" }
+r-efi = { version = "5.2.0" }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

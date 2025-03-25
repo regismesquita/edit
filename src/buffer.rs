@@ -2181,7 +2181,7 @@ pub struct GapBuffer {
 
 impl GapBuffer {
     fn new(small: bool) -> apperr::Result<Self> {
-        const RESERVE: usize = 2 * 1024 * 1024 * 1024;
+        const RESERVE: usize = 256 * 1048576;
 
         let buffer;
         let text;

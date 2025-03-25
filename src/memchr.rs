@@ -31,11 +31,7 @@ static mut MEMCHR2_DISPATCH: unsafe fn(
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 unsafe fn memchr2_dispatch(needle1: u8, needle2: u8, beg: *const u8, end: *const u8) -> *const u8 {
-    let func = if is_x86_feature_detected!("avx2") {
-        memchr2_avx2
-    } else {
-        memchr2_fallback
-    };
+    let func = memchr2_fallback;
     unsafe { MEMCHR2_DISPATCH = func };
     unsafe { func(needle1, needle2, beg, end) }
 }
@@ -66,79 +62,6 @@ unsafe fn memchr2_fallback(
             beg = beg.add(1);
         }
         beg
-    }
-}
-
-// FWIW, I found that adding support for AVX512 was not useful at the time,
-// as it only marginally improved file load performance by <5%.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
-unsafe fn memchr2_avx2(needle1: u8, needle2: u8, mut beg: *const u8, end: *const u8) -> *const u8 {
-    unsafe {
-        use std::arch::x86_64::*;
-
-        let n1 = _mm256_set1_epi8(needle1 as i8);
-        let n2 = _mm256_set1_epi8(needle2 as i8);
-        let mut remaining = distance(end, beg);
-
-        while remaining >= 32 {
-            let v = _mm256_loadu_si256(beg as *const _);
-            let a = _mm256_cmpeq_epi8(v, n1);
-            let b = _mm256_cmpeq_epi8(v, n2);
-            let c = _mm256_or_si256(a, b);
-            let m = _mm256_movemask_epi8(c) as u32;
-
-            if m != 0 {
-                return beg.add(m.trailing_zeros() as usize);
-            }
-
-            beg = beg.add(32);
-            remaining -= 32;
-        }
-
-        memchr2_fallback(needle1, needle2, beg, end)
-
-        // TODO: This code probably works correctly but requires more testing.
-        /*
-        // Handle the remaining <32 bytes by reading 32 bytes and masking out the irrelevant data.
-        // This works, because x86 does not care about slice boundaries. It does care about page boundaries, however.
-        if remaining > 0 {
-            // Data beyond the beg/end range may not be mapped in. As such, we need to avoid reading beyond the
-            // page boundaries. This assumes 4KiB pages or larger. If we're in the lower half of the 4KiB page,
-            // we load data from `end.sub(off) == end.sub(remaining) == beg`, since we know that this 32-byte read
-            // can't possibly read 2KiB. Otherwise, we load from `end.sub(off) == end.sub(32)`, which essentially
-            // means we read such that the end of the read is aligned with the end of the haystack. The start of the
-            // SIMD register will then contain garbage we must ignore.
-            let off = if ((beg as usize) & 2048) != 0 {
-                32
-            } else {
-                remaining
-            };
-
-            let v = _mm256_loadu_si256(end.sub(off) as *const _);
-            let a = _mm256_cmpeq_epi8(v, n1);
-            let b = _mm256_cmpeq_epi8(v, n2);
-            let c = _mm256_or_si256(a, b);
-            let m = _mm256_movemask_epi8(c) as u32;
-
-            // If we were in the upper half of the 4KiB page, we must shift the mask such that it's not aligned with
-            // the end of the haystack but rather with the current `beg`: A shift of `32 - remaining` is needed,
-            // which equals `off - remaining`. Otherwise, we must not shift at all. Luckily `off` will be `remaining`
-            // in that case and `remaining - remaining` is 0.
-            let m = m >> (off - remaining);
-
-            // If we were in the lower half of the 4KiB page, we must mask out anything beyond the end of
-            // the haystack. Here, we basically restrict the "length" if `m` to contain `remaining`-many bits.
-            // In case of a read in the upper half this won't do anything, but that's fine. Branchless code is great.
-            let m = m & ((1 << remaining) - 1);
-
-            if m != 0 {
-                return beg.add(m.trailing_zeros() as usize);
-            }
-        }
-
-        end
-        */
     }
 }
 
@@ -207,11 +130,7 @@ static mut MEMRCHR2_DISPATCH: unsafe fn(
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 unsafe fn memrchr2_dispatch(needle1: u8, needle2: u8, beg: *const u8, end: *const u8) -> *const u8 {
-    let func = if is_x86_feature_detected!("avx2") {
-        memrchr2_avx2
-    } else {
-        memrchr2_fallback
-    };
+    let func = memrchr2_fallback;
     unsafe { MEMRCHR2_DISPATCH = func };
     unsafe { func(needle1, needle2, beg, end) }
 }
@@ -242,39 +161,6 @@ unsafe fn memrchr2_fallback(
             }
         }
         null()
-    }
-}
-
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
-unsafe fn memrchr2_avx2(needle1: u8, needle2: u8, beg: *const u8, mut end: *const u8) -> *const u8 {
-    unsafe {
-        use std::arch::x86_64::*;
-
-        if distance(end, beg) >= 32 {
-            let n1 = _mm256_set1_epi8(needle1 as i8);
-            let n2 = _mm256_set1_epi8(needle2 as i8);
-
-            loop {
-                end = end.sub(32);
-
-                let v = _mm256_loadu_si256(end as *const _);
-                let a = _mm256_cmpeq_epi8(v, n1);
-                let b = _mm256_cmpeq_epi8(v, n2);
-                let c = _mm256_or_si256(a, b);
-                let m = _mm256_movemask_epi8(c) as u32;
-
-                if m != 0 {
-                    return end.add(31 - m.leading_zeros() as usize);
-                }
-
-                if distance(end, beg) < 32 {
-                    break;
-                }
-            }
-        }
-
-        memrchr2_fallback(needle1, needle2, beg, end)
     }
 }
 
