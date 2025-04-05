@@ -1,3 +1,4 @@
+#![feature(uefi_std)]
 #![allow(clippy::missing_transmute_annotations, clippy::new_without_default)]
 
 pub mod apperr;

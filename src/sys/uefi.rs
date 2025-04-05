@@ -5,6 +5,7 @@ use std::alloc::{alloc, dealloc, Layout};
 use std::ffi::{c_int, c_void, CStr, OsString};
 use std::fmt::Write;
 use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 //use std::os::uefi::ffi::OsStrExt;
 use r_efi::efi;
@@ -70,7 +71,10 @@ impl InputKeyMod {
 */
 
 pub fn preferred_languages() -> Vec<String> {
-    return ["en"].iter().map(|s| s.to_string()).collect();
+    vec![
+        "en".to_string()
+    ]
+    //return ["en"].iter().map(|s| s.to_string()).collect();
 }
 
 pub fn init() -> apperr::Result<()> {
@@ -298,29 +302,31 @@ pub unsafe fn virtual_commit(base: *mut u8, size: usize) -> apperr::Result<()> {
 
 // It'd be nice to constrain T to std::marker::FnPtr, but that's unstable.
 pub fn get_proc_address<T>(handle: *mut c_void, name: &CStr) -> apperr::Result<T> { unsafe {
-    Err(apperr::Error::new(efi::Status::NOT_FOUND.as_usize() as u32))
+    Err(apperr::Error::new_sys(efi::Status::NOT_FOUND.as_usize() as u32))
 }}
 
-pub fn load_icu() -> apperr::Result<*mut c_void> { unsafe {
-    Err(apperr::Error::new(efi::Status::NOT_FOUND.as_usize() as u32))
+pub fn load_libicuuc() -> apperr::Result<*mut c_void> { unsafe {
+    Err(apperr::Error::new_sys(efi::Status::NOT_FOUND.as_usize() as u32))
 }}
 
-#[inline]
-pub fn io_error_to_apperr(err: std::io::Error) -> apperr::Error {
-    unsafe { apperr::Error::new((err.raw_os_error().unwrap_or((err.kind() as usize)|0xFF00) as u32).max(1)) }
-}
+pub fn load_libicui18n() -> apperr::Result<*mut c_void> { unsafe {
+    Err(apperr::Error::new_sys(efi::Status::NOT_FOUND.as_usize() as u32))
+}}
 
-pub fn format_error(err: apperr::Error) -> String {
-    let errno = err.value() & 0xFFFF;
+pub fn apperr_format(code: u32) -> String {
+    let errno = code & 0xFFFF;
     let result = format!("Error {:x}", errno);
 
     result
 }
 
 fn errno_to_apperr(no: c_int) -> apperr::Error {
-    unsafe { apperr::Error::new(no.max(1) as u32) }
+    unsafe { apperr::Error::new_sys(no.max(1) as u32) }
 }
 
+pub fn io_error_to_apperr(err: std::io::Error) -> apperr::Error {
+    unsafe { apperr::Error::new_sys((err.raw_os_error().unwrap_or((err.kind() as usize)|0xFF00) as u32).max(1)) }
+}
 /*
 fn check_int_return(ret: libc::c_int) -> apperr::Result<libc::c_int> {
     if ret < 0 {
@@ -332,3 +338,15 @@ fn check_int_return(ret: libc::c_int) -> apperr::Result<libc::c_int> {
 
 
 */
+
+pub fn switch_modes() -> apperr::Result<()> {
+    Ok({})
+}
+
+pub fn canonicalize<P: AsRef<Path>>(path: P) -> apperr::Result<PathBuf> {
+    Ok(PathBuf::from(path.as_ref()))
+}
+
+pub fn apperr_is_not_found(_err: apperr::Error) -> bool {
+    false
+}

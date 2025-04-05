@@ -1,3 +1,4 @@
+#![feature(uefi_std)]
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use edit::helpers::*;
 use edit::ucd::MeasurementConfig;

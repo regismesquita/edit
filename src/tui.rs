@@ -3,7 +3,7 @@ use crate::framebuffer::{Attributes, Framebuffer, INDEXED_COLORS_COUNT, IndexedC
 use crate::helpers::{CoordType, Point, Rect, Size, hash, hash_str, wymix};
 use crate::input::{InputKeyMod, kbmod, vk};
 use crate::ucd::Document;
-use crate::{helpers, input, sys, trust_me_bro, ucd};
+use crate::{helpers, input, trust_me_bro, ucd};
 use std::fmt::Write as _;
 use std::iter;
 use std::mem;
@@ -42,9 +42,6 @@ pub struct Tui {
     /// Last known mouse state.
     mouse_state: InputMouseState,
     mouse_is_drag: bool,
-    last_click: std::time::Instant,
-    last_click_target: u64,
-    last_click_position: Point,
 
     clipboard: Vec<u8>,
     cached_text_buffers: Vec<CachedTextBuffer>,
@@ -81,9 +78,6 @@ impl Tui {
             mouse_down_position: Point::MIN,
             mouse_state: InputMouseState::None,
             mouse_is_drag: false,
-            last_click: std::time::Instant::now(),
-            last_click_target: 0,
-            last_click_position: Point::MIN,
 
             clipboard: Vec::new(),
             cached_text_buffers: Vec::with_capacity(16),
@@ -203,12 +197,15 @@ impl Tui {
                 input_keyboard = Some(keyboard);
             }
             Some(input::Input::Mouse(_)) => {
+                /*
 
                 let mut hovered_node = null();
                 let mut focused_node = null();
 
                 for root in self.prev_tree.iterate_roots() {
                     Tree::visit_all(root, root, 0, true, |_, node| {
+                        return VisitControl::SkipChildren;
+                        /*
                         if !node.outer_clipped.contains(next_position) {
                             // Skip the entire sub-tree, because it doesn't contain the cursor.
                             return VisitControl::SkipChildren;
@@ -218,6 +215,7 @@ impl Tui {
                             focused_node = node;
                         }
                         VisitControl::Continue
+                        */
                     });
                 }
 
@@ -264,6 +262,7 @@ impl Tui {
                 input_scroll_delta = next_scroll;
                 self.mouse_position = next_position;
                 self.mouse_state = next_state;
+                */
             }
         }
 
@@ -436,6 +435,13 @@ impl Tui {
             self.render_node(child);
         }
         self.framebuffer.render()
+    }
+    pub fn render_sys(&mut self) {
+        self.framebuffer.reset(self.size);
+        for child in self.prev_tree.iterate_roots() {
+            self.render_node(child);
+        }
+        self.framebuffer.render_sys()
     }
 
     /// Recursively renders each node and its children.

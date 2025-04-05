@@ -30,6 +30,7 @@ use edit::sys;
 use edit::tui::*;
 use edit::vt::{self, Token};
 use edit::{apperr, icu};
+use std::ffi::CString;
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
 use std::{cmp, process};
@@ -303,11 +304,13 @@ fn run() -> apperr::Result<()> {
             last_latency_width = cols;
             sys::write_stdout(&output);
         }
-        #[cfg(not(feature = "debug-latency"))]
+        #[cfg(all(not(target_os="uefi"), not(feature = "debug-latency")))]
         {
             let output = tui.render();
             sys::write_stdout(&output);
         }
+        #[cfg(target_os="uefi")]
+        tui.render_sys();
     }
 
     Ok(())

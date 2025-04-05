@@ -2,7 +2,10 @@ use crate::helpers::{self, CoordType, Point, Rect, Size};
 use crate::ucd;
 use std::fmt::Write;
 use std::ops::{BitOr, BitXor};
+use std::ptr::swap;
 use std::slice::ChunksExact;
+
+use crate::sys;
 
 #[derive(Clone, Copy)]
 pub enum IndexedColor {
@@ -411,6 +414,116 @@ impl Framebuffer {
         }
 
         result
+    }
+
+    pub fn render_sys(&mut self) {
+        let idx = self.frame_counter & 1;
+        let back = unsafe {
+            let ptr = self.buffers.as_mut_ptr();
+            let back = &mut *ptr.add(idx);
+            back
+        };
+
+        let mut back_lines = back.text.lines.iter();
+        let mut back_bgs = back.bg_bitmap.iter();
+        let mut back_fgs = back.fg_bitmap.iter();
+        let mut back_attrs = back.attributes.iter();
+
+        let mut last_bg = self.indexed(IndexedColor::Background);
+        let mut last_fg = self.indexed(IndexedColor::Foreground);
+        let mut last_attr = Attributes::None;
+
+        sys::move_cursor(0, 0);
+        sys::set_color(7, 0);
+        for y in 0..back.text.size.height {
+            // SAFETY: The only thing that changes the size of these containers,
+            // is the reset() method and it always resets front/back to the same size.
+            let back_line = unsafe { back_lines.next().unwrap_unchecked() };
+            let back_bg = unsafe { back_bgs.next().unwrap_unchecked() };
+            let back_fg = unsafe { back_fgs.next().unwrap_unchecked() };
+            let back_attr = unsafe { back_attrs.next().unwrap_unchecked() };
+
+            let line_bytes = back_line.as_bytes();
+            let mut cfg = ucd::MeasurementConfig::new(&line_bytes);
+            let mut chunk_end = 0;
+
+            sys::move_cursor(0, y as usize + 1);
+
+            while {
+                let bg = back_bg[chunk_end];
+                let fg = back_fg[chunk_end];
+                let attr = back_attr[chunk_end];
+
+                // Chunk into runs of the same color.
+                while {
+                    chunk_end += 1;
+                    chunk_end < back_bg.len()
+                        && back_bg[chunk_end] == bg
+                        && back_fg[chunk_end] == fg
+                        && back_attr[chunk_end] == attr
+                } {}
+
+                let mut cch = false;
+                if last_bg != bg {
+                    last_bg = bg;
+                    cch = true;
+                }
+
+                if last_fg != fg {
+                    last_fg = fg;
+                    cch = true;
+                }
+
+                if last_attr != attr {
+                    let diff = last_attr ^ attr;
+                    /*
+                    if diff.underlined() {
+                        if attr.underlined() {
+                            result.push_str("\x1b[4m");
+                        } else {
+                            result.push_str("\x1b[24m");
+                        }
+                    }
+                    */
+                    if diff.reverse() {
+                        cch = true;
+                    }
+                    last_attr = attr;
+                }
+
+                if cch {
+                    let (mut f, mut b) = (last_fg, last_bg);
+                    if attr.reverse() {
+                        std::mem::swap(&mut f, &mut b);
+                    }
+                    sys::set_color(f, b);
+                }
+
+                let beg = cfg.cursor().offset;
+                let end = cfg
+                    .goto_visual(Point {
+                        x: chunk_end as CoordType,
+                        y: 0,
+                    })
+                    .offset;
+                sys::write_stdout(&back_line[beg..end]);
+
+                chunk_end < back_bg.len()
+            } {}
+        }
+
+        // If the cursor has changed since the last frame we naturally need to update it,
+        // but this also applies if the code above wrote to the screen,
+        // as it uses CUP sequences to reposition the cursor for writing.
+        if back.cursor.pos.x >= 0 && back.cursor.pos.y >= 0 {
+            // CUP to the cursor position.
+            // DECSCUSR to set the cursor style.
+            // DECTCEM to show the cursor.
+            sys::move_cursor(back.cursor.pos.x as usize, back.cursor.pos.y as usize);
+        } else {
+            // DECTCEM to hide the cursor.
+            //result.push_str("\x1b[?25l");
+        }
     }
 }
 
