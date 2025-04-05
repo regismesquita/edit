@@ -6,7 +6,7 @@ use std::fs::{self, File};
 use std::mem::MaybeUninit;
 use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
-use std::ptr::{null, null_mut};
+use std::ptr::{self, null, null_mut};
 use std::{mem, time};
 use windows_sys::Win32::Foundation;
 use windows_sys::Win32::Globalization;
@@ -39,6 +39,8 @@ unsafe extern "system" fn read_console_input_ex_placeholder(
 
 const CONSOLE_READ_NOWAIT: u16 = 0x0002;
 
+const INVALID_CONSOLE_MODE: u32 = u32::MAX;
+
 struct State {
     read_console_input_ex: ReadConsoleInputExW,
     stdin: Foundation::HANDLE,
@@ -58,8 +60,8 @@ static mut STATE: State = State {
     stdout: null_mut(),
     stdin_cp_old: 0,
     stdout_cp_old: 0,
-    stdin_mode_old: 0,
-    stdout_mode_old: 0,
+    stdin_mode_old: INVALID_CONSOLE_MODE,
+    stdout_mode_old: INVALID_CONSOLE_MODE,
     leading_surrogate: 0,
     inject_resize: false,
     wants_exit: false,
@@ -73,39 +75,90 @@ extern "system" fn console_ctrl_handler(_ctrl_type: u32) -> Foundation::BOOL {
     1
 }
 
-pub fn init() -> apperr::Result<()> {
+pub fn init() -> apperr::Result<Deinit> {
     unsafe {
-        let kernel32 = LibraryLoader::GetModuleHandleW(w!("kernel32.dll"));
-        STATE.read_console_input_ex = get_proc_address(kernel32, c"ReadConsoleInputExW")?;
+        // Get the stdin and stdout handles first, so that if this function fails,
+        // we at least got something to use for `write_stdout`.
+        STATE.stdin = Console::GetStdHandle(Console::STD_INPUT_HANDLE);
+        STATE.stdout = Console::GetStdHandle(Console::STD_OUTPUT_HANDLE);
 
+        // Reopen stdin if it's redirected (= piped input).
+        if !ptr::eq(STATE.stdin, Foundation::INVALID_HANDLE_VALUE)
+            && matches!(
+                FileSystem::GetFileType(STATE.stdin),
+                FileSystem::FILE_TYPE_DISK | FileSystem::FILE_TYPE_PIPE
+            )
+        {
+            STATE.stdin = FileSystem::CreateFileW(
+                w!("CONIN$"),
+                Foundation::GENERIC_READ | Foundation::GENERIC_WRITE,
+                FileSystem::FILE_SHARE_READ | FileSystem::FILE_SHARE_WRITE,
+                null_mut(),
+                FileSystem::OPEN_EXISTING,
+                0,
+                null_mut(),
+            );
+        }
+
+        if ptr::eq(STATE.stdin, Foundation::INVALID_HANDLE_VALUE)
+            || ptr::eq(STATE.stdout, Foundation::INVALID_HANDLE_VALUE)
+        {
+            return Err(get_last_error());
+        }
+
+        unsafe fn load_read_func(module: *const u16) -> apperr::Result<ReadConsoleInputExW> {
+            unsafe { get_module(module).and_then(|m| get_proc_address(m, c"ReadConsoleInputExW")) }
+        }
+
+        // `kernel32.dll` doesn't exist on OneCore variants of Windows.
+        // NOTE: `kernelbase.dll` is NOT a stable API to rely on. In our case it's the best option though.
+        //
+        // This is written as two nested `match` statements so that we can return the error from the first
+        // `load_read_func` call if it fails. The kernel32.dll lookup may contain some valid information,
+        // while the kernelbase.dll lookup may not, since it's not a stable API.
+        STATE.read_console_input_ex = match load_read_func(w!("kernel32.dll")) {
+            Ok(func) => func,
+            Err(err) => match load_read_func(w!("kernelbase.dll")) {
+                Ok(func) => func,
+                Err(_) => return Err(err),
+            },
+        };
+
+        Ok(Deinit)
+    }
+}
+
+pub struct Deinit;
+
+impl Drop for Deinit {
+    fn drop(&mut self) {
+        unsafe {
+            if STATE.stdin_cp_old != 0 {
+                Console::SetConsoleCP(STATE.stdin_cp_old);
+                STATE.stdin_cp_old = 0;
+            }
+            if STATE.stdout_cp_old != 0 {
+                Console::SetConsoleOutputCP(STATE.stdout_cp_old);
+                STATE.stdout_cp_old = 0;
+            }
+            if STATE.stdin_mode_old != INVALID_CONSOLE_MODE {
+                Console::SetConsoleMode(STATE.stdin, STATE.stdin_mode_old);
+                STATE.stdin_mode_old = INVALID_CONSOLE_MODE;
+            }
+            if STATE.stdout_mode_old != INVALID_CONSOLE_MODE {
+                Console::SetConsoleMode(STATE.stdout, STATE.stdout_mode_old);
+                STATE.stdout_mode_old = INVALID_CONSOLE_MODE;
+            }
+        }
+    }
+}
+
+pub fn switch_modes() -> apperr::Result<()> {
+    unsafe {
         check_bool_return(Console::SetConsoleCtrlHandler(
             Some(console_ctrl_handler),
             1,
         ))?;
-
-        STATE.stdin = FileSystem::CreateFileW(
-            w!("CONIN$"),
-            Foundation::GENERIC_READ | Foundation::GENERIC_WRITE,
-            FileSystem::FILE_SHARE_READ | FileSystem::FILE_SHARE_WRITE,
-            null_mut(),
-            FileSystem::OPEN_EXISTING,
-            0,
-            null_mut(),
-        );
-        STATE.stdout = FileSystem::CreateFileW(
-            w!("CONOUT$"),
-            Foundation::GENERIC_READ | Foundation::GENERIC_WRITE,
-            FileSystem::FILE_SHARE_READ | FileSystem::FILE_SHARE_WRITE,
-            null_mut(),
-            FileSystem::OPEN_EXISTING,
-            0,
-            null_mut(),
-        );
-        if STATE.stdin == Foundation::INVALID_HANDLE_VALUE
-            || STATE.stdout == Foundation::INVALID_HANDLE_VALUE
-        {
-            return Err(get_last_error());
-        }
 
         STATE.stdin_cp_old = Console::GetConsoleCP();
         STATE.stdout_cp_old = Console::GetConsoleOutputCP();
@@ -138,15 +191,6 @@ pub fn init() -> apperr::Result<()> {
     }
 }
 
-pub fn deinit() {
-    unsafe {
-        Console::SetConsoleCP(STATE.stdin_cp_old);
-        Console::SetConsoleOutputCP(STATE.stdout_cp_old);
-        Console::SetConsoleMode(STATE.stdin, STATE.stdin_mode_old);
-        Console::SetConsoleMode(STATE.stdout, STATE.stdout_mode_old);
-    }
-}
-
 pub fn inject_window_size_into_stdin() {
     unsafe {
         STATE.inject_resize = true;
@@ -175,46 +219,49 @@ fn get_console_size() -> Option<Size> {
 /// Returns `None` if there was an error reading from stdin.
 /// Returns `Some("")` if the given timeout was reached.
 /// Otherwise, it returns the read, non-empty string.
-pub fn read_stdin(timeout: time::Duration) -> Option<String> {
+pub fn read_stdin(mut timeout: time::Duration) -> Option<String> {
+    // On startup we're asked to inject a window size so that the UI system can layout the elements.
+    // --> Inject a fake sequence for our input parser.
+    let mut resize_event = None;
+    if unsafe { STATE.inject_resize } {
+        unsafe { STATE.inject_resize = false };
+        timeout = time::Duration::ZERO;
+        resize_event = get_console_size();
+    }
+
+    let read_poll = timeout != time::Duration::MAX; // there is a timeout -> don't block in read()
     let mut input_buf = [const { MaybeUninit::<Console::INPUT_RECORD>::uninit() }; 1024];
     let mut input_buf_cap = input_buf.len();
     let mut utf16_buf = [const { MaybeUninit::<u16>::uninit() }; 1024];
     let mut utf16_buf_len = 0;
-    let mut resize_event = None;
-    let mut read_more = true;
-    let mut read_poll = false;
 
-    if unsafe { STATE.inject_resize } {
-        resize_event = get_console_size();
-        read_poll = true;
-        unsafe { STATE.inject_resize = false };
+    // If there was a leftover leading surrogate from the last read, we prepend it to the buffer.
+    if unsafe { STATE.leading_surrogate } != 0 {
+        utf16_buf[0] = MaybeUninit::new(unsafe { STATE.leading_surrogate });
+        utf16_buf_len = 1;
+        input_buf_cap -= 1;
+        unsafe { STATE.leading_surrogate = 0 };
     }
 
-    if timeout != time::Duration::MAX {
-        read_poll = true;
-        let wait_result =
-            unsafe { Threading::WaitForSingleObject(STATE.stdin, timeout.as_millis() as u32) };
-        match wait_result {
-            // Ready to read? Continue with reading below.
-            // `read_more` is already true to ensure we don't block.
-            Foundation::WAIT_OBJECT_0 => {}
-            // Timeout? Skip reading entirely.
-            Foundation::WAIT_TIMEOUT => read_more = false,
-            // Error? Tell the caller stdin is broken.
-            _ => return None,
-        }
-    }
+    // Read until there's either a timeout or we have something to process.
+    loop {
+        if timeout != time::Duration::MAX {
+            let beg = time::Instant::now();
 
-    // This loops exists, just in case there's events in the input buffer that we aren't interested in.
-    // It should be rare for this to loop.
-    while read_more {
-        if unsafe { STATE.leading_surrogate } != 0 {
-            utf16_buf[0] = MaybeUninit::new(unsafe { STATE.leading_surrogate });
-            utf16_buf_len = 1;
-            input_buf_cap -= 1;
-            unsafe { STATE.leading_surrogate = 0 };
+            match unsafe { Threading::WaitForSingleObject(STATE.stdin, timeout.as_millis() as u32) }
+            {
+                // Ready to read? Continue with reading below.
+                Foundation::WAIT_OBJECT_0 => {}
+                // Timeout? Skip reading entirely.
+                Foundation::WAIT_TIMEOUT => break,
+                // Error? Tell the caller stdin is broken.
+                _ => return None,
+            }
+
+            timeout = timeout.saturating_sub(beg.elapsed());
         }
 
+        // Read from stdin.
         let input = unsafe {
             // If we had a `inject_resize`, we don't want to block indefinitely for other pending input on startup,
             // but are still interested in any other pending input that may be waiting for us.
@@ -230,9 +277,10 @@ pub fn read_stdin(timeout: time::Duration) -> Option<String> {
             if ok == 0 || STATE.wants_exit {
                 return None;
             }
-            &*(&input_buf[..read as usize] as *const _ as *const [Console::INPUT_RECORD])
+            helpers::slice_assume_init_ref(&input_buf[..read as usize])
         };
 
+        // Convert Win32 input records into UTF16.
         for inp in input {
             match inp.EventType as u32 {
                 Console::KEY_EVENT => {
@@ -260,7 +308,9 @@ pub fn read_stdin(timeout: time::Duration) -> Option<String> {
             }
         }
 
-        read_more = !resize_event.is_some() && utf16_buf_len == 0;
+        if resize_event.is_some() || utf16_buf_len != 0 {
+            break;
+        }
     }
 
     const RESIZE_EVENT_FMT_MAX_LEN: usize = 16; // "\x1b[8;65535;65535t"
@@ -273,6 +323,7 @@ pub fn read_stdin(timeout: time::Duration) -> Option<String> {
     let utf8_max_len = (utf16_buf_len + 1) * 3;
     let mut text = String::with_capacity(utf8_max_len + resize_event_len);
 
+    // Now prepend our previously extracted resize event.
     if let Some(resize_event) = resize_event {
         // If I read xterm's documentation correctly, CSI 18 t reports the window size in characters.
         // CSI 8 ; height ; width t is the response. Of course, we didn't send the request,
@@ -288,7 +339,7 @@ pub fn read_stdin(timeout: time::Duration) -> Option<String> {
     if utf16_buf_len > 0 {
         unsafe {
             let last_char = utf16_buf[utf16_buf_len - 1].assume_init();
-            if 0xD800 <= last_char && last_char <= 0xDBFF {
+            if (0xD800..0xDC00).contains(&last_char) {
                 STATE.leading_surrogate = last_char;
                 utf16_buf_len -= 1;
             }
@@ -341,11 +392,11 @@ pub fn write_stdout(text: &str) {
 pub fn open_stdin_if_redirected() -> Option<File> {
     unsafe {
         let handle = Console::GetStdHandle(Console::STD_INPUT_HANDLE);
-        match FileSystem::GetFileType(handle) {
-            FileSystem::FILE_TYPE_DISK | FileSystem::FILE_TYPE_PIPE => {
-                Some(File::from_raw_handle(handle))
-            }
-            _ => None,
+        // Did we reopen stdin during `init()`?
+        if !std::ptr::eq(STATE.stdin, handle) {
+            Some(File::from_raw_handle(handle))
+        } else {
+            None
         }
     }
 }
@@ -355,10 +406,7 @@ pub fn canonicalize<P: AsRef<Path>>(path: P) -> apperr::Result<PathBuf> {
     let path = path.as_mut_os_string();
     let mut path = mem::take(path).into_encoded_bytes();
 
-    if path.len() > 6
-        && &path[0..4] == br"\\?\"
-        && (b'A'..b'Z').contains(&path[4])
-        && path[5] == b':'
+    if path.len() > 6 && &path[0..4] == br"\\?\" && path[4].is_ascii_uppercase() && path[5] == b':'
     {
         path.drain(0..4);
     }
@@ -368,6 +416,14 @@ pub fn canonicalize<P: AsRef<Path>>(path: P) -> apperr::Result<PathBuf> {
     Ok(path)
 }
 
+/// Reserves a virtual memory region of the given size.
+/// To commit the memory, use `virtual_commit`.
+/// To release the memory, use `virtual_release`.
+///
+/// # Safety
+///
+/// This function is unsafe because it uses raw pointers.
+/// Don't forget to release the memory when you're done with it or you'll leak it.
 pub unsafe fn virtual_reserve(size: usize) -> apperr::Result<*mut u8> {
     unsafe {
         let mut base = null_mut();
@@ -387,12 +443,25 @@ pub unsafe fn virtual_reserve(size: usize) -> apperr::Result<*mut u8> {
     }
 }
 
+/// Releases a virtual memory region of the given size.
+///
+/// # Safety
+///
+/// This function is unsafe because it uses raw pointers.
+/// Make sure to only pass pointers acquired from `virtual_reserve`.
 pub unsafe fn virtual_release(base: *mut u8, size: usize) {
     unsafe {
         Memory::VirtualFree(base as *mut _, size, Memory::MEM_RELEASE);
     }
 }
 
+/// Commits a virtual memory region of the given size.
+///
+/// # Safety
+///
+/// This function is unsafe because it uses raw pointers.
+/// Make sure to only pass pointers acquired from `virtual_reserve`
+/// and to pass a size less than or equal to the size passed to `virtual_reserve`.
 pub unsafe fn virtual_commit(base: *mut u8, size: usize) -> apperr::Result<()> {
     unsafe {
         check_ptr_return(Memory::VirtualAlloc(
@@ -405,6 +474,10 @@ pub unsafe fn virtual_commit(base: *mut u8, size: usize) -> apperr::Result<()> {
     }
 }
 
+unsafe fn get_module(name: *const u16) -> apperr::Result<Foundation::HMODULE> {
+    unsafe { check_ptr_return(LibraryLoader::GetModuleHandleW(name)) }
+}
+
 unsafe fn load_library(name: *const u16) -> apperr::Result<Foundation::HMODULE> {
     unsafe {
         check_ptr_return(LibraryLoader::LoadLibraryExW(
@@ -415,6 +488,13 @@ unsafe fn load_library(name: *const u16) -> apperr::Result<Foundation::HMODULE> 
     }
 }
 
+/// Loads a function from a dynamic library.
+///
+/// # Safety
+///
+/// This function is highly unsafe as it requires you to know the exact type
+/// of the function you're loading. No type checks whatsoever are performed.
+//
 // It'd be nice to constrain T to std::marker::FnPtr, but that's unstable.
 pub unsafe fn get_proc_address<T>(handle: Foundation::HMODULE, name: &CStr) -> apperr::Result<T> {
     unsafe {
@@ -427,8 +507,12 @@ pub unsafe fn get_proc_address<T>(handle: Foundation::HMODULE, name: &CStr) -> a
     }
 }
 
-pub unsafe fn load_icu() -> apperr::Result<Foundation::HMODULE> {
-    unsafe { load_library(w!("icu.dll")) }
+pub fn load_libicuuc() -> apperr::Result<Foundation::HMODULE> {
+    unsafe { load_library(w!("icuuc.dll")) }
+}
+
+pub fn load_libicui18n() -> apperr::Result<Foundation::HMODULE> {
+    unsafe { load_library(w!("icuin.dll")) }
 }
 
 pub fn preferred_languages() -> Vec<String> {
@@ -482,14 +566,12 @@ fn get_last_error() -> apperr::Error {
 }
 
 #[inline]
-fn gle_to_apperr(gle: u32) -> apperr::Error {
-    unsafe {
-        apperr::Error::new(if gle == 0 {
-            0x8000FFFF
-        } else {
-            0x80070000 | gle
-        })
-    }
+const fn gle_to_apperr(gle: u32) -> apperr::Error {
+    apperr::Error::new_sys(if gle == 0 {
+        0x8000FFFF
+    } else {
+        0x80070000 | gle
+    })
 }
 
 #[inline]
@@ -497,7 +579,7 @@ pub fn io_error_to_apperr(err: std::io::Error) -> apperr::Error {
     gle_to_apperr(err.raw_os_error().unwrap_or(0) as u32)
 }
 
-pub fn format_error(err: apperr::Error) -> String {
+pub fn apperr_format(code: u32) -> String {
     unsafe {
         let mut ptr: *mut u8 = null_mut();
         let len = Debug::FormatMessageA(
@@ -505,14 +587,14 @@ pub fn format_error(err: apperr::Error) -> String {
                 | Debug::FORMAT_MESSAGE_FROM_SYSTEM
                 | Debug::FORMAT_MESSAGE_IGNORE_INSERTS,
             null(),
-            err.value() as u32,
+            code,
             0,
             &mut ptr as *mut *mut _ as *mut _,
             0,
             null_mut(),
         );
 
-        let mut result = format!("Error {:#08x}", err.value());
+        let mut result = format!("Error {:#08x}", code);
 
         if len > 0 {
             let msg = helpers::str_from_raw_parts(ptr, len as usize);
@@ -525,6 +607,10 @@ pub fn format_error(err: apperr::Error) -> String {
 
         result
     }
+}
+
+pub fn apperr_is_not_found(err: apperr::Error) -> bool {
+    err == gle_to_apperr(Foundation::ERROR_FILE_NOT_FOUND)
 }
 
 fn check_bool_return(ret: Foundation::BOOL) -> apperr::Result<()> {

@@ -1,7 +1,10 @@
-use crate::helpers::{CoordType, Point, Rect, Size};
-use crate::{helpers, sys, ucd};
+use crate::helpers::{self, CoordType, Point, Rect, Size};
+use crate::ucd;
 use std::fmt::Write;
+use std::ops::{BitOr, BitXor};
+use std::slice::ChunksExact;
 
+#[derive(Clone, Copy)]
 pub enum IndexedColor {
     Black,
     Red,
@@ -19,8 +22,8 @@ pub enum IndexedColor {
     BrightMagenta,
     BrightCyan,
     BrightWhite,
-    DefaultBackground,
-    DefaultForeground,
+    Background,
+    Foreground,
 }
 
 pub const INDEXED_COLORS_COUNT: usize = 18;
@@ -33,26 +36,18 @@ pub const DEFAULT_THEME: [u32; INDEXED_COLORS_COUNT] = [
 
 pub struct Framebuffer {
     indexed_colors: [u32; INDEXED_COLORS_COUNT],
-    size: Size,
-    lines: Vec<String>,
-    bg_bitmap: Vec<u32>,
-    fg_bitmap: Vec<u32>,
+    buffers: [Buffer; 2],
+    frame_counter: usize,
     auto_colors: [u32; 2], // [dark, light]
-    cursor: Point,
-    cursor_overtype: bool,
 }
 
 impl Framebuffer {
     pub fn new() -> Self {
         Self {
             indexed_colors: DEFAULT_THEME,
-            size: Size::default(),
-            lines: Vec::new(),
-            bg_bitmap: Vec::new(),
-            fg_bitmap: Vec::new(),
+            buffers: Default::default(),
+            frame_counter: 0,
             auto_colors: [0, 0],
-            cursor: Point { x: -1, y: -1 },
-            cursor_overtype: false,
         }
     }
 
@@ -63,49 +58,45 @@ impl Framebuffer {
             self.indexed_colors[IndexedColor::Black as usize],
             self.indexed_colors[IndexedColor::BrightWhite as usize],
         ];
-        if !Self::quick_is_dark(self.auto_colors[0]) {
+        if !Bitmap::quick_is_dark(self.auto_colors[0]) {
             self.auto_colors.swap(0, 1);
         }
     }
 
     pub fn reset(&mut self, size: Size) {
-        let width = size.width as usize;
+        if size != self.buffers[0].bg_bitmap.size {
+            for buffer in &mut self.buffers {
+                buffer.text = LineBuffer::new(size);
+                buffer.bg_bitmap = Bitmap::new(size);
+                buffer.fg_bitmap = Bitmap::new(size);
+                buffer.attributes = AttributeBuffer::new(size);
+            }
 
-        if size != self.size {
-            let height = size.height as usize;
-            let area = width * height;
-            self.size = size;
-            self.lines = vec![String::new(); height];
-            self.bg_bitmap = vec![0; area];
-            self.fg_bitmap = vec![0; area];
+            let front = &mut self.buffers[self.frame_counter & 1];
+            // Trigger a full redraw. (Yes, it's a hack.)
+            front.fg_bitmap.fill(1);
+            // Trigger a cursor update as well, just to be sure.
+            front.cursor = Cursor::new_invalid();
         }
 
-        let bg = self.indexed_colors[IndexedColor::DefaultBackground as usize];
-        self.bg_bitmap.fill(bg);
-        self.fg_bitmap.fill(0);
-        self.cursor = Point { x: -1, y: -1 };
+        self.frame_counter = self.frame_counter.wrapping_add(1);
 
-        for l in &mut self.lines {
-            l.clear();
-            l.reserve(width + width / 2);
-            helpers::string_append_repeat(l, ' ', width);
-        }
+        let back = &mut self.buffers[self.frame_counter & 1];
+        let bg = self.indexed_colors[IndexedColor::Background as usize];
+        let fg = self.indexed_colors[IndexedColor::Foreground as usize];
+
+        back.text.fill_whitespace();
+        back.bg_bitmap.fill(bg);
+        back.fg_bitmap.fill(fg);
+        back.attributes.reset();
+        back.cursor = Cursor::new_disabled();
     }
 
     /// Replaces text contents in a single line of the framebuffer.
     /// All coordinates are in viewport coordinates.
     /// Assumes that all tabs have been replaced with spaces.
     ///
-    /// # Arguments
-    ///
-    /// * `y` - The y-coordinate of the line to replace.
-    /// * `origin_x` - The x-coordinate where the text should be inserted.
-    /// * `clip_right` - The x-coordinate past which the text will be clipped.
-    /// * `text` - The text to insert.
-    ///
-    /// # Returns
-    ///
-    /// The rectangle that was updated.
+    /// TODO: This function is ripe for performance improvements.
     pub fn replace_text(
         &mut self,
         y: CoordType,
@@ -113,90 +104,8 @@ impl Framebuffer {
         clip_right: CoordType,
         text: &str,
     ) -> Rect {
-        let Some(line) = self.lines.get_mut(y as usize) else {
-            return Rect::default();
-        };
-
-        let bytes = text.as_bytes();
-        let clip_right = clip_right.clamp(0, self.size.width);
-        let layout_width = clip_right - origin_x;
-
-        // Can't insert text that can't fit or is empty.
-        if layout_width <= 0 || bytes.is_empty() {
-            return Rect::default();
-        }
-
-        let mut cfg = ucd::MeasurementConfig::new(&bytes);
-
-        // Check if the text intersects with the left edge of the framebuffer
-        // and figure out the parts that are inside.
-        let mut left = origin_x;
-        if left < 0 {
-            let cursor = cfg.goto_visual(Point { x: -left, y: 0 });
-            left += cursor.visual_pos.x;
-
-            if left < 0 && cursor.offset < text.len() {
-                // `-left` must've intersected a wide glyph. Go to the next one.
-                let cursor = cfg.goto_logical(Point {
-                    x: cursor.logical_pos.x + 1,
-                    y: 0,
-                });
-                left += cursor.visual_pos.x;
-            }
-        }
-
-        // If the text still starts outside the framebuffer, we must've ran out of text above.
-        // Otherwise, if it starts outside the right edge to begin with, we can't insert it anyway.
-        if left < 0 || left >= clip_right {
-            return Rect::default();
-        }
-
-        // Measure the width of the new text (= `res_new.visual_target.x`).
-        let res_new = cfg.goto_visual(Point {
-            x: layout_width,
-            y: 0,
-        });
-
-        // Figure out at which byte offset the new text gets inserted.
-        let right = left + res_new.visual_pos.x;
-        let line_bytes = line.as_bytes();
-        let mut cfg_old = ucd::MeasurementConfig::new(&line_bytes);
-        let res_old_beg = cfg_old.goto_visual(Point { x: left, y: 0 });
-        let mut res_old_end = cfg_old.goto_visual(Point { x: right, y: 0 });
-
-        // Since the goto functions will always stop short of the target position,
-        // we need to manually step beyond it if we intersect with a wide glyph.
-        if res_old_end.visual_pos.x < right {
-            res_old_end = cfg_old.goto_logical(Point {
-                x: res_old_end.logical_pos.x + 1,
-                y: 0,
-            });
-        }
-
-        // If we intersect a wide glyph, we need to pad the new text with spaces.
-        let mut str_new = &text[..res_new.offset];
-        let mut str_buf = String::new();
-        let overlap_beg = left - res_old_beg.visual_pos.x;
-        let overlap_end = res_old_end.visual_pos.x - right;
-        if overlap_beg > 0 || overlap_end > 0 {
-            if overlap_beg > 0 {
-                helpers::string_append_repeat(&mut str_buf, ' ', overlap_beg as usize);
-            }
-            str_buf.push_str(str_new);
-            if overlap_end > 0 {
-                helpers::string_append_repeat(&mut str_buf, ' ', overlap_end as usize);
-            }
-            str_new = &str_buf;
-        }
-
-        (*line).replace_range(res_old_beg.offset..res_old_end.offset, str_new);
-
-        Rect {
-            left,
-            top: y,
-            right,
-            bottom: y + 1,
-        }
+        let back = &mut self.buffers[self.frame_counter & 1];
+        back.text.replace_text(y, origin_x, clip_right, text)
     }
 
     pub fn draw_scrollbar(
@@ -314,98 +223,394 @@ impl Framebuffer {
         self.indexed_colors[index as usize]
     }
 
-    /// Blends a background color over the given rectangular area.
-    pub fn blend_bg(&mut self, target: Rect, bg: u32) {
-        Self::alpha_blend_rect(&mut self.bg_bitmap[..], target, self.size, bg);
+    #[inline]
+    pub fn indexed_alpha(&self, index: IndexedColor, alpha: u8) -> u32 {
+        self.indexed_colors[index as usize] & ((alpha as u32) << 24 | 0xffffff)
     }
 
-    /// Blends a foreground color over the given rectangular area.
+    pub fn contrasted(&self, color: u32) -> u32 {
+        self.auto_colors[Bitmap::quick_is_dark(color) as usize]
+    }
+
+    pub fn blend_bg(&mut self, target: Rect, bg: u32) {
+        let back = &mut self.buffers[self.frame_counter & 1];
+        back.bg_bitmap.blend(target, bg);
+    }
+
     pub fn blend_fg(&mut self, target: Rect, fg: u32) {
-        if fg != 0 {
-            Self::alpha_blend_rect(&mut self.fg_bitmap[..], target, self.size, fg);
-        } else {
-            self.blend_rect_auto(target);
+        let back = &mut self.buffers[self.frame_counter & 1];
+        back.fg_bitmap.blend(target, fg);
+    }
+
+    pub fn replace_attr(&mut self, target: Rect, mask: Attributes, attr: Attributes) {
+        let back = &mut self.buffers[self.frame_counter & 1];
+        back.attributes.replace(target, mask, attr);
+    }
+    pub fn flip_attr(&mut self, target: Rect, attr: Attributes) {
+        let back = &mut self.buffers[self.frame_counter & 1];
+        back.attributes.flip(target, attr);
+    }
+
+    pub fn set_cursor(&mut self, pos: Point, overtype: bool) {
+        let back = &mut self.buffers[self.frame_counter & 1];
+        back.cursor.pos = pos;
+        back.cursor.overtype = overtype;
+    }
+
+    pub fn render(&mut self) -> String {
+        let idx = self.frame_counter & 1;
+        let (back, front) = unsafe {
+            let ptr = self.buffers.as_mut_ptr();
+            let back = &mut *ptr.add(idx);
+            let front = &*ptr.add(1 - idx);
+            (back, front)
+        };
+
+        let mut front_lines = front.text.lines.iter(); // hahaha
+        let mut front_bgs = front.bg_bitmap.iter();
+        let mut front_fgs = front.fg_bitmap.iter();
+        let mut front_attrs = front.attributes.iter();
+
+        let mut back_lines = back.text.lines.iter();
+        let mut back_bgs = back.bg_bitmap.iter();
+        let mut back_fgs = back.fg_bitmap.iter();
+        let mut back_attrs = back.attributes.iter();
+
+        let mut result = String::with_capacity(256);
+        let mut last_bg = self.indexed(IndexedColor::Background);
+        let mut last_fg = self.indexed(IndexedColor::Foreground);
+        let mut last_attr = Attributes::None;
+
+        for y in 0..front.text.size.height {
+            // SAFETY: The only thing that changes the size of these containers,
+            // is the reset() method and it always resets front/back to the same size.
+            let front_line = unsafe { front_lines.next().unwrap_unchecked() };
+            let front_bg = unsafe { front_bgs.next().unwrap_unchecked() };
+            let front_fg = unsafe { front_fgs.next().unwrap_unchecked() };
+            let front_attr = unsafe { front_attrs.next().unwrap_unchecked() };
+
+            let back_line = unsafe { back_lines.next().unwrap_unchecked() };
+            let back_bg = unsafe { back_bgs.next().unwrap_unchecked() };
+            let back_fg = unsafe { back_fgs.next().unwrap_unchecked() };
+            let back_attr = unsafe { back_attrs.next().unwrap_unchecked() };
+
+            // TODO: Ideally, we should properly diff the contents and so if
+            // only parts of a line change, we should only update those parts.
+            if front_line == back_line
+                && front_bg == back_bg
+                && front_fg == back_fg
+                && front_attr == back_attr
+            {
+                continue;
+            }
+
+            let line_bytes = back_line.as_bytes();
+            let mut cfg = ucd::MeasurementConfig::new(&line_bytes);
+            let mut chunk_end = 0;
+
+            if result.is_empty() {
+                result.push_str("\x1b[m");
+            }
+            _ = write!(result, "\x1b[{};1H", y + 1);
+
+            while {
+                let bg = back_bg[chunk_end];
+                let fg = back_fg[chunk_end];
+                let attr = back_attr[chunk_end];
+
+                // Chunk into runs of the same color.
+                while {
+                    chunk_end += 1;
+                    chunk_end < back_bg.len()
+                        && back_bg[chunk_end] == bg
+                        && back_fg[chunk_end] == fg
+                        && back_attr[chunk_end] == attr
+                } {}
+
+                if last_bg != bg {
+                    last_bg = bg;
+                    if bg == self.indexed_colors[IndexedColor::Background as usize] {
+                        result.push_str("\x1b[49m");
+                    } else {
+                        _ = write!(
+                            result,
+                            "\x1b[48;2;{};{};{}m",
+                            bg & 0xff,
+                            (bg >> 8) & 0xff,
+                            (bg >> 16) & 0xff
+                        );
+                    }
+                }
+
+                if last_fg != fg {
+                    last_fg = fg;
+                    if fg == self.indexed_colors[IndexedColor::Foreground as usize] {
+                        result.push_str("\x1b[39m");
+                    } else {
+                        _ = write!(
+                            result,
+                            "\x1b[38;2;{};{};{}m",
+                            fg & 0xff,
+                            (fg >> 8) & 0xff,
+                            (fg >> 16) & 0xff
+                        );
+                    }
+                }
+
+                if last_attr != attr {
+                    let diff = last_attr ^ attr;
+                    if diff.underlined() {
+                        if attr.underlined() {
+                            result.push_str("\x1b[4m");
+                        } else {
+                            result.push_str("\x1b[24m");
+                        }
+                    }
+                    if diff.reverse() {
+                        if attr.reverse() {
+                            result.push_str("\x1b[7m");
+                        } else {
+                            result.push_str("\x1b[27m");
+                        }
+                    }
+                    last_attr = attr;
+                }
+
+                let beg = cfg.cursor().offset;
+                let end = cfg
+                    .goto_visual(Point {
+                        x: chunk_end as CoordType,
+                        y: 0,
+                    })
+                    .offset;
+                result.push_str(&back_line[beg..end]);
+
+                chunk_end < back_bg.len()
+            } {}
+        }
+
+        // If the cursor has changed since the last frame we naturally need to update it,
+        // but this also applies if the code above wrote to the screen,
+        // as it uses CUP sequences to reposition the cursor for writing.
+        if !result.is_empty() || back.cursor != front.cursor {
+            if back.cursor.pos.x >= 0 && back.cursor.pos.y >= 0 {
+                // CUP to the cursor position.
+                // DECSCUSR to set the cursor style.
+                // DECTCEM to show the cursor.
+                _ = write!(
+                    result,
+                    "\x1b[{};{}H\x1b[{} q\x1b[?25h",
+                    back.cursor.pos.y + 1,
+                    back.cursor.pos.x + 1,
+                    if back.cursor.overtype { 1 } else { 5 }
+                );
+            } else {
+                // DECTCEM to hide the cursor.
+                result.push_str("\x1b[?25l");
+            }
+        }
+
+        result
+    }
+}
+
+pub fn mix(dst: u32, src: u32, balance: f32) -> u32 {
+    Bitmap::mix(dst, src, balance, 1.0 - balance)
+}
+
+#[derive(Default)]
+struct Buffer {
+    text: LineBuffer,
+    bg_bitmap: Bitmap,
+    fg_bitmap: Bitmap,
+    attributes: AttributeBuffer,
+    cursor: Cursor,
+}
+
+#[derive(Default)]
+struct LineBuffer {
+    lines: Vec<String>,
+    size: Size,
+}
+
+impl LineBuffer {
+    fn new(size: Size) -> Self {
+        Self {
+            lines: vec![String::new(); size.height as usize],
+            size,
         }
     }
 
-    /// Performs alpha blending on a rectangle inside the destination bitmap.
-    fn alpha_blend_rect(dst: &mut [u32], rect: Rect, size: Size, src: u32) {
-        let width = size.width;
-        let height = size.height;
-        let left = rect.left.clamp(0, width);
-        let right = rect.right.clamp(0, width);
-        let top = rect.top.clamp(0, height);
-        let bottom = rect.bottom.clamp(0, height);
+    fn fill_whitespace(&mut self) {
+        let width = self.size.width as usize;
+        for l in &mut self.lines {
+            l.clear();
+            l.reserve(width + width / 2);
+            helpers::string_append_repeat(l, ' ', width);
+        }
+    }
 
-        if left >= right || top >= bottom {
+    /// Replaces text contents in a single line of the framebuffer.
+    /// All coordinates are in viewport coordinates.
+    /// Assumes that all tabs have been replaced with spaces.
+    ///
+    /// TODO: This function is ripe for performance improvements.
+    pub fn replace_text(
+        &mut self,
+        y: CoordType,
+        origin_x: CoordType,
+        clip_right: CoordType,
+        text: &str,
+    ) -> Rect {
+        let Some(line) = self.lines.get_mut(y as usize) else {
+            return Rect::default();
+        };
+
+        let bytes = text.as_bytes();
+        let clip_right = clip_right.clamp(0, self.size.width);
+        let layout_width = clip_right - origin_x;
+
+        // Can't insert text that can't fit or is empty.
+        if layout_width <= 0 || bytes.is_empty() {
+            return Rect::default();
+        }
+
+        let mut cfg = ucd::MeasurementConfig::new(&bytes);
+
+        // Check if the text intersects with the left edge of the framebuffer
+        // and figure out the parts that are inside.
+        let mut left = origin_x;
+        if left < 0 {
+            let cursor = cfg.goto_visual(Point { x: -left, y: 0 });
+            left += cursor.visual_pos.x;
+
+            if left < 0 && cursor.offset < text.len() {
+                // `-left` must've intersected a wide glyph and since goto_visual stops _before_ reaching the target,
+                // we stoped before the wide glyph and thus must step forward to the next glyph.
+                let cursor = cfg.goto_logical(Point {
+                    x: cursor.logical_pos.x + 1,
+                    y: 0,
+                });
+                left += cursor.visual_pos.x;
+            }
+        }
+
+        // If the text still starts outside the framebuffer, we must've ran out of text above.
+        // Otherwise, if it starts outside the right edge to begin with, we can't insert it anyway.
+        if left < 0 || left >= clip_right {
+            return Rect::default();
+        }
+
+        // Measure the width of the new text (= `res_new.visual_target.x`).
+        let res_new = cfg.goto_visual(Point {
+            x: layout_width,
+            y: 0,
+        });
+
+        // Figure out at which byte offset the new text gets inserted.
+        let right = left + res_new.visual_pos.x;
+        let line_bytes = line.as_bytes();
+        let mut cfg_old = ucd::MeasurementConfig::new(&line_bytes);
+        let res_old_beg = cfg_old.goto_visual(Point { x: left, y: 0 });
+        let mut res_old_end = cfg_old.goto_visual(Point { x: right, y: 0 });
+
+        // Since the goto functions will always stop short of the target position,
+        // we need to manually step beyond it if we intersect with a wide glyph.
+        if res_old_end.visual_pos.x < right {
+            res_old_end = cfg_old.goto_logical(Point {
+                x: res_old_end.logical_pos.x + 1,
+                y: 0,
+            });
+        }
+
+        // If we intersect a wide glyph, we need to pad the new text with spaces.
+        let mut str_new = &text[..res_new.offset];
+        let mut str_buf = String::new();
+        let overlap_beg = left - res_old_beg.visual_pos.x;
+        let overlap_end = res_old_end.visual_pos.x - right;
+        if overlap_beg > 0 || overlap_end > 0 {
+            if overlap_beg > 0 {
+                helpers::string_append_repeat(&mut str_buf, ' ', overlap_beg as usize);
+            }
+            str_buf.push_str(str_new);
+            if overlap_end > 0 {
+                helpers::string_append_repeat(&mut str_buf, ' ', overlap_end as usize);
+            }
+            str_new = &str_buf;
+        }
+
+        (*line).replace_range(res_old_beg.offset..res_old_end.offset, str_new);
+
+        Rect {
+            left,
+            top: y,
+            right,
+            bottom: y + 1,
+        }
+    }
+}
+
+#[derive(Default)]
+struct Bitmap {
+    data: Vec<u32>,
+    size: Size,
+}
+
+impl Bitmap {
+    fn new(size: Size) -> Self {
+        Self {
+            data: vec![0; (size.width * size.height) as usize],
+            size,
+        }
+    }
+
+    fn fill(&mut self, color: u32) {
+        self.data.fill(color);
+    }
+
+    fn blend(&mut self, target: Rect, color: u32) {
+        if (color & 0xff000000) == 0x00000000 {
             return;
         }
 
-        if (src & 0xff000000) == 0xff000000 {
-            for y in top..bottom {
-                let beg = (y * width + left) as usize;
-                let end = (y * width + right) as usize;
-                dst[beg..end].fill(src);
-            }
-        } else if (src & 0xff000000) != 0x00000000 {
-            for y in top..bottom {
-                let beg = (y * width + left) as usize;
-                let end = (y * width + right) as usize;
-                let mut off = beg;
+        let target = target.intersect(self.size.as_rect());
+        if target.is_empty() {
+            return;
+        }
+
+        let top = target.top as usize;
+        let bottom = target.bottom as usize;
+        let left = target.left as usize;
+        let right = target.right as usize;
+        let stride = self.size.width as usize;
+
+        for y in top..bottom {
+            let beg = y * stride + left;
+            let end = y * stride + right;
+            let data = &mut self.data[beg..end];
+
+            if (color & 0xff000000) == 0xff000000 {
+                data.fill(color);
+            } else {
+                let end = data.len();
+                let mut off = 0;
 
                 while {
-                    let color = dst[off];
+                    let c = data[off];
 
                     // Chunk into runs of the same color, so that we only call alpha_blend once per run.
                     let chunk_beg = off;
                     while {
                         off += 1;
-                        off < end && dst[off] == color
+                        off < end && data[off] == c
                     } {}
                     let chunk_end = off;
 
-                    let color = Self::mix(color, src, 1.0, 1.0);
-                    dst[chunk_beg..chunk_end].fill(color);
+                    data[chunk_beg..chunk_end].fill(Self::mix(c, color, 1.0, 1.0));
 
                     off < end
                 } {}
             }
-        }
-    }
-
-    fn blend_rect_auto(&mut self, rect: Rect) {
-        let width = self.size.width;
-        let height = self.size.height;
-        let left = rect.left.clamp(0, width);
-        let right = rect.right.clamp(0, width);
-        let top = rect.top.clamp(0, height);
-        let bottom = rect.bottom.clamp(0, height);
-
-        if left >= right || top >= bottom {
-            return;
-        }
-
-        for y in top..bottom {
-            let beg = (y * width + left) as usize;
-            let end = (y * width + right) as usize;
-            let mut off = beg;
-
-            while {
-                let bg = self.bg_bitmap[off];
-
-                // Chunk into runs of the same color, so that we only call Self::quick_is_dark once per run.
-                let chunk_beg = off;
-                while {
-                    off += 1;
-                    off < end && self.bg_bitmap[off] == bg
-                } {}
-                let chunk_end = off;
-
-                let fg = self.auto_colors[Self::quick_is_dark(bg) as usize];
-                self.fg_bitmap[chunk_beg..chunk_end].fill(fg);
-
-                off < end
-            } {}
         }
     }
 
@@ -459,70 +664,132 @@ impl Framebuffer {
         l < 128 * 14
     }
 
-    pub fn set_cursor(&mut self, pos: Point, overtype: bool) {
-        self.cursor = pos;
-        self.cursor_overtype = overtype;
-    }
-
-    pub fn render(&mut self) -> String {
-        sys::move_cursor(0, 0);
-
-        let mut last_bg = self.bg_bitmap[0];
-        let mut last_fg = self.fg_bitmap[0];
-        // Invert the colors to force a color change on the first cell.
-        last_bg ^= 1;
-        last_fg ^= 1;
-
-        for y in 0..self.size.height {
-            if y != 0 {
-                sys::write_stdout("\r\n");
-            }
-
-            let line = &self.lines[y as usize][..];
-            let line_bytes = line.as_bytes();
-            let mut cfg = ucd::MeasurementConfig::new(&line_bytes);
-
-            for x in 0..self.size.width {
-                let bg = self.bg_bitmap[(y * self.size.width + x) as usize];
-                let fg = self.fg_bitmap[(y * self.size.width + x) as usize];
-                if bg == last_bg && fg == last_fg {
-                    continue;
-                }
-
-                if x != 0 {
-                    let beg = cfg.cursor().offset;
-                    let end = cfg.goto_visual(Point { x, y: 0 }).offset;
-                    sys::write_stdout(&line[beg..end]);
-                }
-
-                if last_bg != bg {
-                    last_bg = bg;
-                    sys::set_color(last_fg, last_bg);
-                }
-
-                if last_fg != fg {
-                    last_fg = fg;
-                    sys::set_color(last_fg, last_bg);
-                }
-            }
-
-            sys::write_stdout(&line[cfg.cursor().offset..]);
-        }
-
-        if self.cursor.x >= 0 && self.cursor.y >= 0 {
-            // CUP to the cursor position.
-            // DECSCUSR to set the cursor style.
-            // DECTCEM to show the cursor.
-            sys::move_cursor(self.cursor.x as usize, self.cursor.y as usize);
-        } else {
-            // DECTCEM to hide the cursor.
-            //result.push_str("\x1b[?25l");
-        }
-
-        "".to_string()
+    /// Iterates over each row in the bitmap.
+    fn iter(&self) -> ChunksExact<u32> {
+        self.data.chunks_exact(self.size.width as usize)
     }
 }
 
-pub fn mix(dst: u32, src: u32, balance: f32) -> u32 {
-    Framebuffer::mix(dst, src, 1.0 - balance, balance)
+#[repr(transparent)]
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub struct Attributes(u8);
+
+#[allow(non_upper_case_globals)] // Mimics an enum, but it's actually a bitfield. Allows simple diffing.
+impl Attributes {
+    pub const None: Attributes = Attributes(0);
+    pub const Underlined: Attributes = Attributes(0b1);
+    pub const Reverse: Attributes = Attributes(0b10);
+    pub const All: Attributes = Attributes(0b11);
+
+    pub const fn underlined(self) -> bool {
+        self.0 & Self::Underlined.0 != 0
+    }
+
+    pub const fn reverse(self) -> bool {
+        self.0 & Self::Reverse.0 != 0
+    }
+}
+
+impl BitOr for Attributes {
+    type Output = Attributes;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Attributes(self.0 | rhs.0)
+    }
+}
+
+impl BitXor for Attributes {
+    type Output = Attributes;
+
+    fn bitxor(self, rhs: Self) -> Self::Output {
+        Attributes(self.0 ^ rhs.0)
+    }
+}
+
+#[derive(Default)]
+struct AttributeBuffer {
+    data: Vec<Attributes>,
+    size: Size,
+}
+
+impl AttributeBuffer {
+    fn new(size: Size) -> Self {
+        Self {
+            data: vec![Default::default(); (size.width * size.height) as usize],
+            size,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.data.fill(Default::default());
+    }
+
+    fn replace(&mut self, target: Rect, mask: Attributes, attr: Attributes) {
+        let target = target.intersect(self.size.as_rect());
+        if target.is_empty() {
+            return;
+        }
+
+        let top = target.top as usize;
+        let bottom = target.bottom as usize;
+        let left = target.left as usize;
+        let right = target.right as usize;
+        let stride = self.size.width as usize;
+
+        for y in top..bottom {
+            let beg = y * stride + left;
+            let end = y * stride + right;
+            for a in &mut self.data[beg..end] {
+                *a = Attributes(a.0 & !mask.0 | attr.0);
+            }
+        }
+    }
+
+    fn flip(&mut self, target: Rect, attr: Attributes) {
+        let target = target.intersect(self.size.as_rect());
+        if target.is_empty() {
+            return;
+        }
+
+        let top = target.top as usize;
+        let bottom = target.bottom as usize;
+        let left = target.left as usize;
+        let right = target.right as usize;
+        let stride = self.size.width as usize;
+
+        for y in top..bottom {
+            let beg = y * stride + left;
+            let end = y * stride + right;
+            for a in &mut self.data[beg..end] {
+                *a = Attributes(a.0 ^ attr.0);
+            }
+        }
+    }
+
+    /// Iterates over each row in the bitmap.
+    fn iter(&self) -> ChunksExact<Attributes> {
+        self.data.chunks_exact(self.size.width as usize)
+    }
+}
+
+#[derive(Default, PartialEq, Eq)]
+struct Cursor {
+    pos: Point,
+    overtype: bool,
+}
+
+impl Cursor {
+    const fn new_invalid() -> Self {
+        Self {
+            pos: Point::MIN,
+            overtype: false,
+        }
+    }
+
+    const fn new_disabled() -> Self {
+        Self {
+            pos: Point { x: -1, y: -1 },
+            overtype: false,
+        }
+    }
 }

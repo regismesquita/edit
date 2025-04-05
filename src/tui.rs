@@ -1,5 +1,5 @@
 use crate::buffer::{CursorMovement, RcTextBuffer};
-use crate::framebuffer::{Framebuffer, INDEXED_COLORS_COUNT, IndexedColor};
+use crate::framebuffer::{Attributes, Framebuffer, INDEXED_COLORS_COUNT, IndexedColor};
 use crate::helpers::{CoordType, Point, Rect, Size, hash, hash_str, wymix};
 use crate::input::{InputKeyMod, kbmod, vk};
 use crate::ucd::Document;
@@ -17,28 +17,6 @@ type InputText<'input> = input::InputText<'input>;
 type InputKey = input::InputKey;
 type InputMouseState = input::InputMouseState;
 
-struct RefinedInputMouse {
-    state: InputMouseState,
-    modifier: u32,
-    gesture: InputMouseGesture,
-}
-
-enum RefinedInput<'a> {
-    None,
-    Text(InputText<'a>),
-    Keyboard(InputKey),
-    Mouse(RefinedInputMouse),
-    Scroll(Point),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum InputMouseGesture {
-    None,
-    Click,
-    DoubleClick,
-    Drag,
-}
-
 struct CachedTextBuffer {
     node_id: u64,
     editor: RcTextBuffer,
@@ -49,6 +27,11 @@ pub struct Tui {
     framebuffer: Framebuffer,
     read_timeout: time::Duration,
 
+    floater_default_bg: u32,
+    floater_default_fg: u32,
+    modal_default_bg: u32,
+    modal_default_fg: u32,
+
     /// Last known terminal size.
     size: Size,
     /// Last known mouse position.
@@ -58,7 +41,10 @@ pub struct Tui {
     mouse_down_position: Point,
     /// Last known mouse state.
     mouse_state: InputMouseState,
-    mouse_gesture: InputMouseGesture,
+    mouse_is_drag: bool,
+    last_click: std::time::Instant,
+    last_click_target: u64,
+    last_click_position: Point,
 
     clipboard: Vec<u8>,
     cached_text_buffers: Vec<CachedTextBuffer>,
@@ -82,6 +68,11 @@ impl Tui {
             framebuffer: Framebuffer::new(),
             read_timeout: time::Duration::MAX,
 
+            floater_default_bg: 0,
+            floater_default_fg: 0,
+            modal_default_bg: 0,
+            modal_default_fg: 0,
+
             size: Size {
                 width: 0,
                 height: 0,
@@ -89,7 +80,10 @@ impl Tui {
             mouse_position: Point::MIN,
             mouse_down_position: Point::MIN,
             mouse_state: InputMouseState::None,
-            mouse_gesture: InputMouseGesture::None,
+            mouse_is_drag: false,
+            last_click: std::time::Instant::now(),
+            last_click_target: 0,
+            last_click_position: Point::MIN,
 
             clipboard: Vec::new(),
             cached_text_buffers: Vec::with_capacity(16),
@@ -122,8 +116,38 @@ impl Tui {
         self.framebuffer.set_indexed_colors(colors);
     }
 
+    pub fn set_floater_default_bg(&mut self, color: u32) {
+        self.floater_default_bg = color;
+    }
+
+    pub fn set_floater_default_fg(&mut self, color: u32) {
+        self.floater_default_fg = color;
+    }
+
+    pub fn set_modal_default_bg(&mut self, color: u32) {
+        self.modal_default_bg = color;
+    }
+
+    pub fn set_modal_default_fg(&mut self, color: u32) {
+        self.modal_default_fg = color;
+    }
+
     pub fn read_timeout(&mut self) -> time::Duration {
         mem::replace(&mut self.read_timeout, time::Duration::MAX)
+    }
+
+    #[inline]
+    pub fn indexed(&self, index: IndexedColor) -> u32 {
+        self.framebuffer.indexed(index)
+    }
+
+    #[inline]
+    pub fn indexed_alpha(&self, index: IndexedColor, alpha: u8) -> u32 {
+        self.framebuffer.indexed_alpha(index, alpha)
+    }
+
+    pub fn contrasted(&self, color: u32) -> u32 {
+        self.framebuffer.contrasted(color)
     }
 
     pub fn create_context<'tui, 'input>(
@@ -134,9 +158,9 @@ impl Tui {
         // Now, a frame later, we must reset it back to none, to stop it from triggering things.
         // Same for Scroll events.
         if self.mouse_state > InputMouseState::Right {
-            self.mouse_state = InputMouseState::None;
-            self.mouse_gesture = InputMouseGesture::None;
             self.mouse_down_position = Point::MIN;
+            self.mouse_state = InputMouseState::None;
+            self.mouse_is_drag = false;
         }
 
         helpers::vec_replace_all_reuse(
@@ -151,7 +175,8 @@ impl Tui {
         let mut input_text = None;
         let mut input_keyboard = None;
         let mut input_mouse_modifiers = kbmod::NONE;
-        let mut input_mouse_gesture = self.mouse_gesture;
+        let mut input_mouse_is_click = false;
+        let mut input_mouse_is_double_click = false;
         let mut input_scroll_delta = Point { x: 0, y: 0 };
         let input_consumed = self.needs_settling();
 
@@ -179,6 +204,66 @@ impl Tui {
             }
             Some(input::Input::Mouse(_)) => {
 
+                let mut hovered_node = null();
+                let mut focused_node = null();
+
+                for root in self.prev_tree.iterate_roots() {
+                    Tree::visit_all(root, root, 0, true, |_, node| {
+                        if !node.outer_clipped.contains(next_position) {
+                            // Skip the entire sub-tree, because it doesn't contain the cursor.
+                            return VisitControl::SkipChildren;
+                        }
+                        hovered_node = node;
+                        if node.attributes.focusable {
+                            focused_node = node;
+                        }
+                        VisitControl::Continue
+                    });
+                }
+
+                Self::build_node_path(
+                    unsafe { hovered_node.as_ref() },
+                    &mut self.hovered_node_path,
+                );
+
+                if self.mouse_state != InputMouseState::None && next_state == InputMouseState::None
+                {
+                    // When the input transitions from some mouse input to no mouse input,
+                    // we'll emit 1 InputMouseAction::Release event.
+                    next_state = InputMouseState::Release;
+                } else if self.mouse_state == InputMouseState::None
+                    && next_state == InputMouseState::Left
+                {
+                    // On left-mouse-down we change focus.
+                    Self::build_node_path(
+                        unsafe { focused_node.as_ref() },
+                        &mut self.focused_node_path,
+                    );
+                    self.mouse_down_position = next_position;
+                    self.needs_more_settling(); // See `needs_more_settling()`.
+                }
+
+                if next_state == InputMouseState::Release && next_position == self.mouse_position {
+                    let click_target = unsafe { focused_node.as_ref() }.map(|n| n.id).unwrap_or(0);
+                    input_mouse_is_click = true;
+                    input_mouse_is_double_click = (now - self.last_click)
+                        <= std::time::Duration::from_millis(500)
+                        && self.last_click_target == click_target
+                        && self.last_click_position == next_position;
+                    self.last_click = now;
+                    self.last_click_target = click_target;
+                    self.last_click_position = next_position;
+                } else if self.mouse_state == InputMouseState::Left
+                    && next_state == InputMouseState::Left
+                    && next_position != self.mouse_position
+                {
+                    self.mouse_is_drag = true;
+                }
+
+                input_mouse_modifiers = mouse.modifiers;
+                input_scroll_delta = next_scroll;
+                self.mouse_position = next_position;
+                self.mouse_state = next_state;
             }
         }
 
@@ -194,7 +279,8 @@ impl Tui {
             input_text,
             input_keyboard,
             input_mouse_modifiers,
-            input_mouse_gesture,
+            input_mouse_is_click,
+            input_mouse_is_double_click,
             input_scroll_delta,
             input_consumed,
 
@@ -294,9 +380,9 @@ impl Tui {
 
         for root in Tree::iterate_siblings(self.prev_tree.root_first) {
             if let Some(float) = &root.attributes.float {
-                let anchor = Tree::node_ref(root.parent).unwrap();
-                let mut x = anchor.outer.left;
-                let mut y = anchor.outer.top;
+                let (mut x, mut y) = Tree::node_ref(root.parent)
+                    .map(|parent| (parent.outer.left, parent.outer.top))
+                    .unwrap_or((0, 0));
                 let size = root.intrinsic_to_outer();
 
                 x += float.offset.x;
@@ -418,6 +504,7 @@ impl Tui {
                 );
             }
         } else if node.attributes.float.is_some() {
+            // Floaters are opaque.
             let mut fill = String::new();
             helpers::string_append_repeat(
                 &mut fill,
@@ -431,31 +518,25 @@ impl Tui {
             }
         }
 
-        if node.attributes.focus_brackets {
-            let has_focus = self.is_node_focused(node.id);
-            let center_y = (node.inner_clipped.top + node.inner_clipped.bottom) / 2;
-            self.framebuffer.replace_text(
-                center_y,
-                node.inner.left - 1,
-                node.inner.left,
-                if has_focus { ">" } else { "[" },
-            );
-            self.framebuffer.replace_text(
-                center_y,
-                node.inner.right,
-                node.inner.right + 1,
-                if has_focus { "<" } else { "]" },
-            );
+        // Floaters are opaque.
+        if node.attributes.float.is_some() {
+            self.framebuffer
+                .replace_attr(outer_clipped, Attributes::All, Attributes::None);
         }
 
         {
-            let mut rect = outer_clipped;
-            if node.attributes.focus_brackets {
-                rect.left += 1;
-                rect.right -= 1;
+            let rect = outer_clipped;
+            let mut bg = node.attributes.bg;
+            let mut fg = node.attributes.fg;
+
+            // Floaters are opaque, i.e. a text selection behind it should not affect it.
+            if node.attributes.float.is_some() {
+                bg |= 0xff000000;
+                fg |= 0xff000000;
             }
-            self.framebuffer.blend_bg(rect, node.attributes.bg);
-            self.framebuffer.blend_fg(rect, node.attributes.fg);
+
+            self.framebuffer.blend_bg(rect, bg);
+            self.framebuffer.blend_fg(rect, fg);
         }
 
         let inner = node.inner;
@@ -531,6 +612,8 @@ impl Tui {
                             &modified,
                         );
                         self.framebuffer.blend_fg(rect, chunk.fg);
+                        self.framebuffer
+                            .replace_attr(rect, chunk.attr_mask, chunk.attr);
                     } else {
                         let mut beg_x = inner.left;
                         for chunk in &content.chunks {
@@ -541,6 +624,8 @@ impl Tui {
                                 &chunk.text,
                             );
                             self.framebuffer.blend_fg(rect, chunk.fg);
+                            self.framebuffer
+                                .replace_attr(rect, chunk.attr_mask, chunk.attr);
                             beg_x = rect.right;
                         }
                     }
@@ -567,7 +652,11 @@ impl Tui {
                     &mut self.framebuffer,
                 );
 
-                if !tc.single_line {
+                if tc.single_line {
+                    if tc.has_focus {
+                        self.framebuffer.flip_attr(destination, Attributes::Reverse);
+                    }
+                } else {
                     // Render the scrollbar.
                     let track = Rect {
                         left: inner_clipped.right - 1,
@@ -778,41 +867,13 @@ impl Tui {
     }
 
     fn move_focus(&mut self, input: InputKey) -> bool {
+        if !matches!(input, vk::TAB | SHIFT_TAB | vk::LEFT | vk::RIGHT) {
+            return false;
+        }
+
         let Some(focused) = self.get_prev_node(self.focused_node_path[0]) else {
             debug_assert!(false); // The caller should've cleaned up the focus path.
             return false;
-        };
-
-        if input == vk::LEFT || input == vk::RIGHT {
-            if let Some(row) = Tree::node_ref(focused.parent) {
-                if let Some(table) = Tree::node_ref(row.parent) {
-                    if matches!(table.content, NodeContent::Table(..)) {
-                        let mut next = if input == vk::LEFT {
-                            focused.siblings.prev
-                        } else {
-                            focused.siblings.next
-                        };
-                        if next.is_null() {
-                            next = if input == vk::LEFT {
-                                row.children.last
-                            } else {
-                                row.children.first
-                            };
-                        }
-                        let next = Tree::node_ref(next).unwrap();
-                        if !ptr::eq(next, focused) {
-                            Tui::build_node_path(Some(next), &mut self.focused_node_path);
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-
-        let forward = match input {
-            SHIFT_TAB => false,
-            vk::TAB => true,
-            _ => return false,
         };
 
         let mut focused_start = focused;
@@ -835,6 +896,69 @@ impl Tui {
             }
             root = Tree::node_ref(root.parent).unwrap();
         }
+
+        if input == vk::LEFT || input == vk::RIGHT {
+            // Find the cell within a row within a table that we're in.
+            // To do so we'll use a circular buffer of the last 3 nodes while we travel up.
+            let mut buf = [null(); 3];
+            let mut idx = buf.len() - 1;
+            let mut node = focused_start;
+
+            loop {
+                idx = (idx + 1) % buf.len();
+                buf[idx] = node;
+                if let NodeContent::Table(..) = &node.content {
+                    break;
+                }
+                if ptr::eq(node, root) {
+                    return false;
+                }
+                node = match Tree::node_ref(node.parent) {
+                    Some(parent) => parent,
+                    None => return false,
+                }
+            }
+
+            // The current `idx` points to the table.
+            // The last item is the row.
+            // The 2nd to last item is the cell.
+            let row = buf[(idx + 3 - 1) % buf.len()];
+            let cell = buf[(idx + 3 - 2) % buf.len()];
+            let Some(row) = Tree::node_ref(row) else {
+                return false;
+            };
+            let Some(cell) = Tree::node_ref(cell) else {
+                return false;
+            };
+
+            let mut next = if input == vk::LEFT {
+                cell.siblings.prev
+            } else {
+                cell.siblings.next
+            };
+            if next.is_null() {
+                next = if input == vk::LEFT {
+                    row.children.last
+                } else {
+                    row.children.first
+                };
+            }
+
+            if let Some(next) = Tree::node_ref(next) {
+                if !ptr::eq(next, cell) {
+                    Tui::build_node_path(Some(next), &mut self.focused_node_path);
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        let forward = match input {
+            SHIFT_TAB => false,
+            vk::TAB => true,
+            _ => return false,
+        };
 
         // If the window doesn't contain any nodes, there's nothing to focus.
         // This also protects against infinite loops below.
@@ -901,7 +1025,8 @@ pub struct Context<'tui, 'input> {
     /// Current keyboard input, if any.
     input_keyboard: Option<InputKey>,
     input_mouse_modifiers: InputKeyMod,
-    input_mouse_gesture: InputMouseGesture,
+    input_mouse_is_click: bool,
+    input_mouse_is_double_click: bool,
     /// By how much the mouse wheel was scrolled since the last frame.
     input_scroll_delta: Point,
     input_consumed: bool,
@@ -925,8 +1050,18 @@ impl Context<'_, '_> {
         self.tui.size
     }
 
+    #[inline]
     pub fn indexed(&self, index: IndexedColor) -> u32 {
-        self.tui.framebuffer.indexed(index)
+        self.tui.indexed(index)
+    }
+
+    #[inline]
+    pub fn indexed_alpha(&self, index: IndexedColor, alpha: u8) -> u32 {
+        self.tui.indexed_alpha(index, alpha)
+    }
+
+    pub fn contrasted(&self, color: u32) -> u32 {
+        self.tui.contrasted(color)
     }
 
     pub fn set_clipboard(&mut self, data: Vec<u8>) {
@@ -1005,11 +1140,11 @@ impl Context<'_, '_> {
     }
 
     pub fn toss_focus_up(&mut self) {
-        let current_node = self.tree.current_node_ref();
+        let node = self.tree.last_node_ref();
         // Check the path length to avoid popping the root node and scheduling a rerender for no reason.
-        if current_node.attributes.focusable
+        if node.attributes.focusable
             && self.tui.focused_node_path.len() >= 2
-            && self.tui.is_node_focused(current_node.id)
+            && self.tui.is_node_focused(node.id)
         {
             self.tui.pop_focusable_node(1);
             self.needs_rerender();
@@ -1050,7 +1185,10 @@ impl Context<'_, '_> {
         let anchor = match spec.anchor {
             Anchor::Last if !last_node.siblings.prev.is_null() => last_node.siblings.prev,
             Anchor::Last | Anchor::Parent => last_node.parent,
-            Anchor::Root => self.tree.root_first,
+            // By not giving such floats a parent, they get the same origin as the original root node,
+            // but they also gain their own "root id" in the tree. That way, their focus path is totally unique,
+            // which means that we can easily check if a modal is open by calling `is_focused()` on the original root.
+            Anchor::Root => null(),
         };
 
         // Remove the node from the UI tree and insert it into the floater list.
@@ -1071,6 +1209,8 @@ impl Context<'_, '_> {
                 y: spec.offset_y,
             },
         });
+        last_node.attributes.bg = self.tui.modal_default_bg;
+        last_node.attributes.fg = self.tui.modal_default_fg;
     }
 
     pub fn attr_border(&mut self) {
@@ -1145,7 +1285,8 @@ impl Context<'_, '_> {
         self.block_begin(classname);
         self.focus_on_first_present();
         self.attr_border();
-        self.attr_background_rgba(self.indexed(IndexedColor::White));
+        self.attr_background_rgba(self.tui.modal_default_bg);
+        self.attr_foreground_rgba(self.tui.modal_default_fg);
         self.attr_float(FloatSpec {
             anchor: Anchor::Root,
             gravity_x: 0.5,
@@ -1239,10 +1380,16 @@ impl Context<'_, '_> {
         });
     }
 
-    pub fn styled_label_set_foreground_indexed(&mut self, index: Option<IndexedColor>) {
-        let fg = index.map(|i| self.indexed(i)).unwrap_or(0);
+    pub fn styled_label_set_foreground(&mut self, color: u32) {
         if let Some(chunk) = self.styled_label_get_last_chunk(true) {
-            chunk.fg = fg;
+            chunk.fg = color;
+        }
+    }
+
+    pub fn styled_label_set_attributes(&mut self, mask: Attributes, attr: Attributes) {
+        if let Some(chunk) = self.styled_label_get_last_chunk(true) {
+            chunk.attr_mask = mask;
+            chunk.attr = attr;
         }
     }
 
@@ -1264,6 +1411,8 @@ impl Context<'_, '_> {
             content.chunks.push(StyledTextChunk {
                 text: String::new(),
                 fg: 0,
+                attr_mask: Attributes::default(),
+                attr: Attributes::default(),
             });
         }
 
@@ -1288,11 +1437,15 @@ impl Context<'_, '_> {
     }
 
     pub fn button(&mut self, classname: &'static str, overflow: Overflow, text: &str) -> bool {
-        self.label(classname, overflow, text);
-
-        let last_node = self.tree.last_node_mut();
-        last_node.attributes.focusable = true;
-        last_node.attributes.focus_brackets = true;
+        self.styled_label_begin(classname, overflow);
+        self.attr_focusable();
+        if self.is_focused() {
+            self.styled_label_set_attributes(Attributes::Reverse, Attributes::Reverse);
+        }
+        self.styled_label_add_text("[");
+        self.styled_label_add_text(text);
+        self.styled_label_add_text("]");
+        self.styled_label_end();
 
         self.button_activated()
     }
@@ -1305,13 +1458,14 @@ impl Context<'_, '_> {
         checked: &mut bool,
     ) -> bool {
         self.styled_label_begin(classname, overflow);
-        self.styled_label_add_text(if *checked { "▣ " } else { "☐ " });
+        self.attr_focusable();
+        if self.is_focused() {
+            self.styled_label_set_attributes(Attributes::Reverse, Attributes::Reverse);
+        }
+        self.styled_label_add_text(if *checked { "[▣ " } else { "[☐ " });
         self.styled_label_add_text(text);
+        self.styled_label_add_text("]");
         self.styled_label_end();
-
-        let last_node = self.tree.last_node_mut();
-        last_node.attributes.focusable = true;
-        last_node.attributes.focus_brackets = true;
 
         let activated = self.button_activated();
         if activated {
@@ -1322,7 +1476,7 @@ impl Context<'_, '_> {
 
     fn button_activated(&mut self) -> bool {
         if !self.input_consumed
-            && ((self.input_mouse_gesture == InputMouseGesture::Click && self.contains_hover())
+            && ((self.input_mouse_is_click && self.contains_hover())
                 || self.input_keyboard == Some(vk::RETURN)
                 || self.input_keyboard == Some(vk::SPACE))
             && self.is_focused()
@@ -1341,7 +1495,10 @@ impl Context<'_, '_> {
     ) -> bool {
         self.block_begin(classname);
 
-        let node = self.tree.current_node_mut();
+        let node = self.tree.last_node_mut();
+        node.attributes.bg = self.indexed(IndexedColor::Cyan);
+        node.attributes.fg = self.contrasted(self.indexed(IndexedColor::Cyan));
+
         let cached;
         if let Some(buffer) = self
             .tui
@@ -1381,12 +1538,7 @@ impl Context<'_, '_> {
     }
 
     fn textarea_internal(&mut self, buffer: RcTextBuffer, single_line: bool) {
-        self.attr_focusable();
-
         let node = self.tree.last_node_mut();
-        node.attributes.bg = self.indexed(IndexedColor::DefaultBackground);
-        node.attributes.fg = self.indexed(IndexedColor::DefaultForeground);
-        node.attributes.focus_brackets = single_line;
 
         let mut content = TextareaContent {
             buffer,
@@ -1426,6 +1578,7 @@ impl Context<'_, '_> {
 
         self.textarea_adjust_scroll_offset(&mut content);
 
+        node.attributes.focusable = true;
         node.intrinsic_size.height = content.buffer.get_visual_line_count();
         node.intrinsic_size_set = true;
         node.content = NodeContent::Textarea(content);
@@ -1466,90 +1619,87 @@ impl Context<'_, '_> {
                 y: mouse.y - inner.top + tc.scroll_offset.y,
             };
 
-            match self.input_mouse_gesture {
-                InputMouseGesture::DoubleClick => {
-                    tb.select_word();
-                }
-                InputMouseGesture::Drag => {
-                    let track_rect = Rect {
-                        left: inner.right - 1,
-                        top: inner.top,
-                        right: inner.right,
-                        bottom: inner.bottom,
-                    };
-                    if track_rect.contains(self.tui.mouse_down_position) {
-                        if tc.scroll_offset_y_drag_start == CoordType::MIN {
-                            tc.scroll_offset_y_drag_start = tc.scroll_offset.y;
+            if self.input_mouse_is_double_click {
+                tb.select_word();
+            } else if self.tui.mouse_is_drag {
+                let track_rect = Rect {
+                    left: inner.right - 1,
+                    top: inner.top,
+                    right: inner.right,
+                    bottom: inner.bottom,
+                };
+                if track_rect.contains(self.tui.mouse_down_position) {
+                    if tc.scroll_offset_y_drag_start == CoordType::MIN {
+                        tc.scroll_offset_y_drag_start = tc.scroll_offset.y;
+                    }
+
+                    // The textarea supports 1 height worth of "scrolling beyond the end".
+                    // `track_height` is the same as the viewport height.
+                    let scrollable_height = tb.get_visual_line_count() - 1;
+
+                    if scrollable_height > 0 {
+                        let trackable = track_rect.height() - tc.thumb_height;
+                        let delta_y = mouse.y - self.tui.mouse_down_position.y;
+                        tc.scroll_offset.y = tc.scroll_offset_y_drag_start
+                            + ((delta_y * scrollable_height) / trackable);
+                    }
+                } else {
+                    tb.selection_update_visual(pos);
+                    tc.preferred_column = tb.get_cursor_visual_pos().x;
+
+                    let height = inner.height();
+
+                    // If the editor is only 1 line tall we can't possibly scroll up or down.
+                    if height >= 2 {
+                        fn calc(min: CoordType, max: CoordType, mouse: CoordType) -> CoordType {
+                            // Otherwise, the scroll zone is up to 3 lines at the top/bottom.
+                            let zone_height = ((max - min) / 2).min(3);
+
+                            // The .y positions where the scroll zones begin:
+                            // Mouse coordinates above top and below bottom respectively.
+                            let scroll_min = min + zone_height;
+                            let scroll_max = max - zone_height - 1;
+
+                            // Calculate the delta for scrolling up or down.
+                            let delta_min = (mouse - scroll_min).clamp(-zone_height, 0);
+                            let delta_max = (mouse - scroll_max).clamp(0, zone_height);
+
+                            // If I didn't mess up my logic here, only one of the two values can possibly be !=0.
+                            let idx = 3 + delta_min + delta_max;
+
+                            const SPEEDS: [CoordType; 7] = [-9, -3, -1, 0, 1, 3, 9];
+                            let idx = idx.clamp(0, SPEEDS.len() as CoordType) as usize;
+                            SPEEDS[idx]
                         }
 
-                        // The textarea supports 1 height worth of "scrolling beyond the end".
-                        // `track_height` is the same as the viewport height.
-                        let scrollable_height = tb.get_visual_line_count() - 1;
+                        let delta_x = calc(text.left, text.right, mouse.x);
+                        let delta_y = calc(text.top, text.bottom, mouse.y);
 
-                        if scrollable_height > 0 {
-                            let trackable = track_rect.height() - tc.thumb_height;
-                            let delta_y = mouse.y - self.tui.mouse_down_position.y;
-                            tc.scroll_offset.y = tc.scroll_offset_y_drag_start
-                                + ((delta_y * scrollable_height) / trackable);
-                        }
-                    } else {
-                        tb.selection_update_visual(pos);
+                        tc.scroll_offset.x += delta_x;
+                        tc.scroll_offset.y += delta_y;
 
-                        let height = inner.height();
-
-                        // If the editor is only 1 line tall we can't possibly scroll up or down.
-                        if height >= 2 {
-                            fn calc(min: CoordType, max: CoordType, mouse: CoordType) -> CoordType {
-                                // Otherwise, the scroll zone is up to 3 lines at the top/bottom.
-                                let zone_height = ((max - min) / 2).min(3);
-
-                                // The .y positions where the scroll zones begin:
-                                // Mouse coordinates above top and below bottom respectively.
-                                let scroll_min = min + zone_height;
-                                let scroll_max = max - zone_height - 1;
-
-                                // Calculate the delta for scrolling up or down.
-                                let delta_min = (mouse - scroll_min).clamp(-zone_height, 0);
-                                let delta_max = (mouse - scroll_max).clamp(0, zone_height);
-
-                                // If I didn't mess up my logic here, only one of the two values can possibly be !=0.
-                                let idx = 3 + delta_min + delta_max;
-
-                                const SPEEDS: [CoordType; 7] = [-9, -3, -1, 0, 1, 3, 9];
-                                let idx = idx.clamp(0, SPEEDS.len() as CoordType) as usize;
-                                SPEEDS[idx]
-                            }
-
-                            let delta_x = calc(text.left, text.right, mouse.x);
-                            let delta_y = calc(text.top, text.bottom, mouse.y);
-
-                            tc.scroll_offset.x += delta_x;
-                            tc.scroll_offset.y += delta_y;
-
-                            if delta_x != 0 || delta_y != 0 {
-                                self.tui.read_timeout = time::Duration::from_millis(25);
-                            }
+                        if delta_x != 0 || delta_y != 0 {
+                            self.tui.read_timeout = time::Duration::from_millis(25);
                         }
                     }
                 }
-                _ => {
-                    match self.tui.mouse_state {
-                        InputMouseState::Left => {
-                            tc.preferred_column = tb.get_cursor_visual_pos().x;
-                            if self.input_mouse_modifiers.contains(kbmod::SHIFT) {
-                                // TODO: Untested because Windows Terminal surprisingly doesn't support Shift+Click.
-                                tb.selection_update_visual(pos);
-                            } else {
-                                tb.cursor_move_to_visual(pos);
-                            }
-                            make_cursor_visible = true;
+            } else {
+                match self.tui.mouse_state {
+                    InputMouseState::Left => {
+                        if self.input_mouse_modifiers.contains(kbmod::SHIFT) {
+                            // TODO: Untested because Windows Terminal surprisingly doesn't support Shift+Click.
+                            tb.selection_update_visual(pos);
+                        } else {
+                            tb.cursor_move_to_visual(pos);
                         }
-                        InputMouseState::Release => {
-                            tc.scroll_offset_y_drag_start = CoordType::MIN;
-                            tb.selection_finalize();
-                        }
-                        _ => return false,
+                        tc.preferred_column = tb.get_cursor_visual_pos().x;
+                        make_cursor_visible = true;
                     }
+                    InputMouseState::Release => {
+                        tc.scroll_offset_y_drag_start = CoordType::MIN;
+                        tb.selection_finalize();
+                    }
+                    _ => return false,
                 }
             }
 
@@ -1697,6 +1847,8 @@ impl Context<'_, '_> {
                     };
                     if modifiers.contains(kbmod::SHIFT) {
                         tb.selection_update_delta(granularity, -1);
+                    } else if let Some((beg, _)) = tb.selection_range() {
+                        unsafe { tb.set_cursor(beg) };
                     } else {
                         tb.cursor_move_delta(granularity, -1);
                     }
@@ -1704,16 +1856,24 @@ impl Context<'_, '_> {
                 vk::UP => {
                     match modifiers {
                         kbmod::NONE => {
+                            let mut x = tc.preferred_column;
+                            let mut y = tb.get_cursor_visual_pos().y - 1;
+
+                            // If there's a selection we the cursor above the start of the selection.
+                            if let Some((beg, _)) = tb.selection_range() {
+                                x = beg.visual_pos.x;
+                                y = beg.visual_pos.y - 1;
+                                tc.preferred_column = x;
+                            }
+
                             // If the cursor was already on the first line,
                             // move it to the start of the buffer.
-                            if tb.get_cursor_visual_pos().y == 0 {
+                            if y < 0 {
+                                x = 0;
                                 tc.preferred_column = 0;
                             }
 
-                            tb.cursor_move_to_visual(Point {
-                                x: tc.preferred_column,
-                                y: tb.get_cursor_visual_pos().y - 1,
-                            });
+                            tb.cursor_move_to_visual(Point { x, y });
                         }
                         kbmod::CTRL => {
                             tc.scroll_offset.y -= 1;
@@ -1745,24 +1905,35 @@ impl Context<'_, '_> {
                     };
                     if modifiers.contains(kbmod::SHIFT) {
                         tb.selection_update_delta(granularity, 1);
+                    } else if let Some((_, end)) = tb.selection_range() {
+                        unsafe { tb.set_cursor(end) };
                     } else {
                         tb.cursor_move_delta(granularity, 1);
                     }
                 }
                 vk::DOWN => match modifiers {
                     kbmod::NONE => {
-                        // If the cursor was already on the last line,
-                        // move it to the end of the buffer.
-                        if tb.get_cursor_visual_pos().y >= tb.get_visual_line_count() - 1 {
-                            tc.preferred_column = CoordType::MAX;
+                        let mut x = tc.preferred_column;
+                        let mut y = tb.get_cursor_visual_pos().y + 1;
+
+                        // If there's a selection we the cursor below the end of the selection.
+                        if let Some((_, end)) = tb.selection_range() {
+                            x = end.visual_pos.x;
+                            y = end.visual_pos.y + 1;
+                            tc.preferred_column = x;
                         }
 
-                        tb.cursor_move_to_visual(Point {
-                            x: tc.preferred_column,
-                            y: tb.get_cursor_visual_pos().y + 1,
-                        });
+                        // If the cursor was already on the last line,
+                        // move it to the end of the buffer.
+                        if y >= tb.get_visual_line_count() {
+                            x = CoordType::MAX;
+                        }
 
-                        if tc.preferred_column == CoordType::MAX {
+                        tb.cursor_move_to_visual(Point { x, y });
+
+                        // If we fell into the `if y >= tb.get_visual_line_count()` above, we wanted to
+                        // update the `preferred_column` but didn't know yet what it was. Now we know!
+                        if x == CoordType::MAX {
                             tc.preferred_column = tb.get_cursor_visual_pos().x;
                         }
                     }
@@ -1803,6 +1974,10 @@ impl Context<'_, '_> {
                 },
                 vk::A => match modifiers {
                     kbmod::CTRL => tb.select_all(),
+                    _ => return false,
+                },
+                vk::H => match modifiers {
+                    kbmod::CTRL => tb.delete(CursorMovement::Word, -1),
                     _ => return false,
                 },
                 vk::X => match modifiers {
@@ -1928,39 +2103,38 @@ impl Context<'_, '_> {
             if !self.input_consumed && self.tui.mouse_state != InputMouseState::None {
                 let container_rect = prev_container.inner;
 
-                match self.input_mouse_gesture {
-                    InputMouseGesture::Drag => {
-                        // We don't need to look up the previous track node,
-                        // since it has a fixed size based on the container size.
-                        let track_rect = Rect {
-                            left: container_rect.right,
-                            top: container_rect.top,
-                            right: container_rect.right + 1,
-                            bottom: container_rect.bottom,
-                        };
-                        if track_rect.contains(self.tui.mouse_down_position) {
-                            if sc.scroll_offset_y_drag_start == CoordType::MIN {
-                                sc.scroll_offset_y_drag_start = sc.scroll_offset.y;
-                            }
-
-                            let content = Tree::node_ref(prev_container.children.first).unwrap();
-                            let content_rect = content.inner;
-                            let content_height = content_rect.height();
-                            let track_height = track_rect.height();
-
-                            if content_height > track_height {
-                                let trackable = track_height - sc.thumb_height;
-                                let scrollable_height = content_height - track_height;
-                                let delta_y =
-                                    self.tui.mouse_position.y - self.tui.mouse_down_position.y;
-                                sc.scroll_offset.y = sc.scroll_offset_y_drag_start
-                                    + ((delta_y * scrollable_height) / trackable);
-                            }
-
-                            self.set_input_consumed();
+                if self.tui.mouse_is_drag {
+                    // We don't need to look up the previous track node,
+                    // since it has a fixed size based on the container size.
+                    let track_rect = Rect {
+                        left: container_rect.right,
+                        top: container_rect.top,
+                        right: container_rect.right + 1,
+                        bottom: container_rect.bottom,
+                    };
+                    if track_rect.contains(self.tui.mouse_down_position) {
+                        if sc.scroll_offset_y_drag_start == CoordType::MIN {
+                            sc.scroll_offset_y_drag_start = sc.scroll_offset.y;
                         }
+
+                        let content = Tree::node_ref(prev_container.children.first).unwrap();
+                        let content_rect = content.inner;
+                        let content_height = content_rect.height();
+                        let track_height = track_rect.height();
+
+                        if content_height > track_height {
+                            let trackable = track_height - sc.thumb_height;
+                            let scrollable_height = content_height - track_height;
+                            let delta_y =
+                                self.tui.mouse_position.y - self.tui.mouse_down_position.y;
+                            sc.scroll_offset.y = sc.scroll_offset_y_drag_start
+                                + ((delta_y * scrollable_height) / trackable);
+                        }
+
+                        self.set_input_consumed();
                     }
-                    _ => match self.tui.mouse_state {
+                } else {
+                    match self.tui.mouse_state {
                         InputMouseState::Release => {
                             sc.scroll_offset_y_drag_start = CoordType::MIN;
                         }
@@ -1972,7 +2146,7 @@ impl Context<'_, '_> {
                             }
                         }
                         _ => {}
-                    },
+                    }
                 }
             }
         }
@@ -1982,6 +2156,7 @@ impl Context<'_, '_> {
 
     pub fn list_begin(&mut self, classname: &'static str) {
         self.block_begin(classname);
+        self.attr_focusable();
 
         let last_node = self.tree.last_node_mut();
         let content = self
@@ -1994,7 +2169,7 @@ impl Context<'_, '_> {
                 }),
                 _ => None,
             })
-            .unwrap_or_else(|| ListContent {
+            .unwrap_or(ListContent {
                 selected: 0,
                 selected_node: ptr::null(),
             });
@@ -2037,8 +2212,8 @@ impl Context<'_, '_> {
         self.styled_label_end();
 
         // Clicking an item activates it
-        let clicked = !self.input_consumed
-            && (self.input_mouse_gesture == InputMouseGesture::DoubleClick && self.is_hovering());
+        let clicked =
+            !self.input_consumed && (self.input_mouse_is_double_click && self.is_hovering());
         // Pressing Enter on a selected item activates it as well
         let entered = focused
             && selected_before
@@ -2108,12 +2283,14 @@ impl Context<'_, '_> {
         // If the list has focus, we also delegate focus to the selected item and colorize it.
         if has_focus {
             node.attributes.bg = self.indexed(IndexedColor::Green);
+            node.attributes.fg = self.contrasted(self.indexed(IndexedColor::Green));
             self.steal_focus_for(node);
         }
     }
 
     pub fn menubar_begin(&mut self) {
         self.table_begin("menubar");
+        self.attr_focus_well();
         self.table_next_row();
     }
 
@@ -2130,15 +2307,8 @@ impl Context<'_, '_> {
         }
 
         if self.contains_focus() {
-            if self.consume_shortcut(vk::ESCAPE) {
-                // TODO: This should reassign the previous focused path.
-                self.needs_rerender();
-                self.tui.focused_node_path.clear();
-                self.tui.focused_node_path.push(ROOT_ID);
-                return false;
-            }
-
             self.attr_background_rgba(self.indexed(IndexedColor::Green));
+            self.attr_foreground_rgba(self.contrasted(self.indexed(IndexedColor::Green)));
 
             self.table_begin("flyout");
             self.attr_float(FloatSpec {
@@ -2149,7 +2319,6 @@ impl Context<'_, '_> {
                 offset_y: 1,
             });
             self.attr_border();
-            self.attr_background_rgba(self.indexed(IndexedColor::White));
             return true;
         }
 
@@ -2161,6 +2330,7 @@ impl Context<'_, '_> {
         self.attr_focusable();
         if self.is_focused() {
             self.attr_background_rgba(self.indexed(IndexedColor::Green));
+            self.attr_foreground_rgba(self.contrasted(self.indexed(IndexedColor::Green)));
         }
 
         let clicked =
@@ -2268,18 +2438,18 @@ impl Context<'_, '_> {
         if off < text.len() {
             // Highlight the accelerator in red.
             self.styled_label_add_text(&text[..off]);
-            self.styled_label_set_foreground_indexed(Some(IndexedColor::BrightRed));
+            self.styled_label_set_attributes(Attributes::Underlined, Attributes::Underlined);
             self.styled_label_add_text(&text[off..off + 1]);
-            self.styled_label_set_foreground_indexed(None);
+            self.styled_label_set_attributes(Attributes::Underlined, Attributes::None);
             self.styled_label_add_text(&text[off + 1..]);
         } else {
             // Add the accelerator in parentheses (still in red).
             let ch = accelerator as u8;
             self.styled_label_add_text(text);
             self.styled_label_add_text("(");
-            self.styled_label_set_foreground_indexed(Some(IndexedColor::BrightRed));
+            self.styled_label_set_attributes(Attributes::Underlined, Attributes::Underlined);
             self.styled_label_add_text(unsafe { helpers::str_from_raw_parts(&ch, 1) });
-            self.styled_label_set_foreground_indexed(None);
+            self.styled_label_set_attributes(Attributes::Underlined, Attributes::None);
             self.styled_label_add_text(")");
         }
 
@@ -2333,7 +2503,7 @@ impl Tree {
         tree.append_child(Node {
             id: ROOT_ID,
             classname: "root",
-            attributes: Attributes {
+            attributes: NodeAttributes {
                 focus_well: true,
                 ..Default::default()
             },
@@ -2564,7 +2734,7 @@ pub enum Overflow {
 }
 
 #[derive(Default)]
-struct Attributes {
+struct NodeAttributes {
     float: Option<FloatAttributes>,
     position: Position,
     padding: Rect,
@@ -2574,7 +2744,6 @@ struct Attributes {
     focusable: bool,
     focus_well: bool, // Prevents focus from leaving via Tab
     focus_void: bool, // Prevents focus from entering via Tab
-    focus_brackets: bool,
 }
 
 struct ListContent {
@@ -2590,6 +2759,8 @@ struct TableContent {
 struct StyledTextChunk {
     text: String,
     fg: u32,
+    attr_mask: Attributes,
+    attr: Attributes,
 }
 
 impl Document for Vec<StyledTextChunk> {
@@ -2648,11 +2819,6 @@ enum NodeContent {
     Scrollarea(ScrollareaContent),
 }
 
-struct ScrollareaThumb {
-    top: CoordType,
-    bottom: CoordType,
-}
-
 struct NodeSiblings {
     prev: *const Node,
     next: *const Node,
@@ -2701,7 +2867,7 @@ pub struct Node {
     children: NodeChildren,
     child_count: usize,
 
-    attributes: Attributes,
+    attributes: NodeAttributes,
     content: NodeContent,
 
     intrinsic_size: Size,
@@ -2747,11 +2913,9 @@ impl Default for Node {
 
 impl Node {
     fn outer_to_inner(&self, mut outer: Rect) -> Rect {
-        let l = self.attributes.bordered || self.attributes.focus_brackets;
+        let l = self.attributes.bordered;
         let t = self.attributes.bordered;
-        let r = self.attributes.bordered
-            || self.attributes.focus_brackets
-            || matches!(self.content, NodeContent::Scrollarea(..));
+        let r = self.attributes.bordered || matches!(self.content, NodeContent::Scrollarea(..));
         let b = self.attributes.bordered;
 
         outer.left += self.attributes.padding.left + l as CoordType;
@@ -2762,11 +2926,9 @@ impl Node {
     }
 
     fn intrinsic_to_outer(&self) -> Size {
-        let l = self.attributes.bordered || self.attributes.focus_brackets;
+        let l = self.attributes.bordered;
         let t = self.attributes.bordered;
-        let r = self.attributes.bordered
-            || self.attributes.focus_brackets
-            || matches!(self.content, NodeContent::Scrollarea(..));
+        let r = self.attributes.bordered || matches!(self.content, NodeContent::Scrollarea(..));
         let b = self.attributes.bordered;
 
         let mut size = self.intrinsic_size;

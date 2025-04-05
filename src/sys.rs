@@ -9,5 +9,9 @@ mod uefi;
 pub use unix::*;
 #[cfg(windows)]
 pub use windows::*;
+
 #[cfg(target_os = "uefi")]
 pub use uefi::*;
+
+#[cfg(not(windows) && not(target_os = "uefi"))]
+pub use std::fs::canonicalize;
