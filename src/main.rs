@@ -204,7 +204,7 @@ fn run() -> apperr::Result<()> {
     let floater_bg = mix(
         tui.indexed(IndexedColor::Background),
         tui.indexed(IndexedColor::Foreground),
-        0.2,
+        0.7,
     );
     let floater_fg = tui.contrasted(floater_bg);
     tui.set_floater_default_bg(floater_bg);

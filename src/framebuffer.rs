@@ -434,7 +434,7 @@ impl Framebuffer {
         let mut last_attr = Attributes::None;
 
         sys::move_cursor(0, 0);
-        sys::set_color(7, 0);
+        sys::set_color(last_fg, last_bg);
         for y in 0..back.text.size.height {
             // SAFETY: The only thing that changes the size of these containers,
             // is the reset() method and it always resets front/back to the same size.
