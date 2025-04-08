@@ -118,78 +118,79 @@ impl Framebuffer {
         content_offset: CoordType,
         content_height: CoordType,
     ) -> CoordType {
-        if track.is_empty() {
+        let track_clipped = track.intersect(clip_rect);
+        if track_clipped.is_empty() {
             return 0;
         }
 
         let viewport_height = track.height();
         // The content height is at least the viewport height.
         let content_height = content_height.max(viewport_height);
+
+        // No need to draw a scrollbar if the content fits in the viewport.
+        let content_offset_max = content_height - viewport_height;
+        if content_offset_max == 0 {
+            return 0;
+        }
+
         // The content offset must be at least one viewport height from the bottom.
         // You don't want to scroll past the end after all...
-        let content_offset = content_offset.clamp(0, content_height - viewport_height);
+        let content_offset = content_offset.clamp(0, content_offset_max);
 
         // In order to increase the visual resolution of the scrollbar,
         // we'll use 1/8th blocks to represent the thumb.
         // First, scale the offsets to get that 1/8th resolution.
         let viewport_height = viewport_height as i64 * 8;
+        let content_offset_max = content_offset_max as i64 * 8;
         let content_offset = content_offset as i64 * 8;
         let content_height = content_height as i64 * 8;
 
         // The proportional thumb height (0-1) is the fraction of viewport and
         // content height. The taller the content, the smaller the thumb:
         // = viewport_height / content_height
-        //
         // We then scale that to the viewport height to get the height in 1/8th units.
         // = viewport_height * viewport_height / content_height
-        //
         // We add content_height/2 to round the integer division, which results in a numerator of:
         // = viewport_height * viewport_height + content_height / 2
-        //
-        // Finally we add +1 to round up the division if `content_height` is uneven. This ensures that
-        // in case of a rounding issue, we'll make the track too large and clamp it to the track size.
-        let thumb_numerator = viewport_height * viewport_height + content_height / 2 + 1;
-        let thumb_height = thumb_numerator / content_height;
+        let numerator = viewport_height * viewport_height + content_height / 2;
+        let thumb_height = numerator / content_height;
         // Ensure the thumb has a minimum size of 1 row.
         let thumb_height = thumb_height.max(8);
 
-        // The proportional thumb top position (0-1) is naturally:
-        // = content_offset / content_height
-        //
-        // The bottom position is 1 viewport-height below the top position:
-        // = (viewport_height + content_offset) / content_height
-        //
-        // Since everything must be scaled to the 1/8th units we must multiply by viewport_height:
-        // = viewport_height * (viewport_height + content_offset) / content_height
-        // = viewport_height * viewport_height + viewport_height * content_offset / content_height
-        //
-        // And we also want that rounded integer division as before. This transforms the
-        // `viewport_height * viewport_height` portion into the `thumb_enumerator` above.
-        // = thumb_numerator + viewport_height * content_offset / content_height
-        //
-        let thumb_bottom = (viewport_height * content_offset + thumb_numerator) / content_height;
-        // Now that the bottom is flush with the bottom of the track, we can calculate the top.
-        let thumb_top = (thumb_bottom - thumb_height).max(0);
+        // The proportional thumb top position (0-1) is:
+        // = content_offset / content_offset_max
+        // The maximum thumb top position is the viewport height minus the thumb height:
+        // = viewport_height - thumb_height
+        // To get the thumb top position in 1/8th units, we multiply both:
+        // = (viewport_height - thumb_height) * content_offset / content_offset_max
+        // We add content_offset_max/2 to round the integer division, which results in a numerator of:
+        // = (viewport_height - thumb_height) * content_offset + content_offset_max / 2
+        let numerator = (viewport_height - thumb_height) * content_offset + content_offset_max / 2;
+        let thumb_top = numerator / content_offset_max;
+        // The thumb bottom position is the thumb top position plus the thumb height.
+        let thumb_bottom = thumb_top + thumb_height;
+
+        // Shift to absolute coordinates.
+        let thumb_top = thumb_top + track.top as i64 * 8;
+        let thumb_bottom = thumb_bottom + track.top as i64 * 8;
+
+        // Clamp to the visible area.
+        let thumb_top = thumb_top.max(track_clipped.top as i64 * 8);
+        let thumb_bottom = thumb_bottom.min(track_clipped.bottom as i64 * 8);
 
         // Calculate the height of the top/bottom cell of the thumb.
         let top_fract = (thumb_top % 8) as CoordType;
         let bottom_fract = (thumb_bottom % 8) as CoordType;
 
         // Shift to absolute coordinates.
-        let thumb_top = ((thumb_top + 7) / 8) as CoordType + track.top;
-        let thumb_bottom = (thumb_bottom / 8) as CoordType + track.top;
-
-        let track_clipped = track.intersect(clip_rect);
-
-        // Clamp to the visible area.
-        let thumb_top_clipped = thumb_top.max(track_clipped.top);
-        let thumb_bottom_clipped = thumb_bottom.min(track_clipped.bottom);
+        let thumb_top = ((thumb_top + 7) / 8) as CoordType;
+        let thumb_bottom = (thumb_bottom / 8) as CoordType;
 
         self.blend_bg(track_clipped, self.indexed(IndexedColor::BrightBlack));
         self.blend_fg(track_clipped, self.indexed(IndexedColor::BrightWhite));
 
         // Draw the full blocks.
-        for y in thumb_top_clipped..thumb_bottom_clipped {
+        for y in thumb_top..thumb_bottom {
             self.replace_text(y, track_clipped.left, track_clipped.right, "█");
         }
 
@@ -200,7 +201,7 @@ impl Framebuffer {
         if top_fract != 0 {
             fract_buf[2] = (0x88 - top_fract) as u8;
             self.replace_text(
-                thumb_top_clipped - 1,
+                thumb_top - 1,
                 track_clipped.left,
                 track_clipped.right,
                 unsafe { std::str::from_utf8_unchecked(&fract_buf) },
@@ -209,7 +210,7 @@ impl Framebuffer {
         if bottom_fract != 0 {
             fract_buf[2] = (0x88 - bottom_fract) as u8;
             let rect = self.replace_text(
-                thumb_bottom_clipped,
+                thumb_bottom,
                 track_clipped.left,
                 track_clipped.right,
                 unsafe { std::str::from_utf8_unchecked(&fract_buf) },
@@ -228,7 +229,7 @@ impl Framebuffer {
 
     #[inline]
     pub fn indexed_alpha(&self, index: IndexedColor, alpha: u8) -> u32 {
-        self.indexed_colors[index as usize] & ((alpha as u32) << 24 | 0xffffff)
+        self.indexed_colors[index as usize] & 0x00ffffff | (alpha as u32) << 24
     }
 
     pub fn contrasted(&self, color: u32) -> u32 {
@@ -243,6 +244,29 @@ impl Framebuffer {
     pub fn blend_fg(&mut self, target: Rect, fg: u32) {
         let back = &mut self.buffers[self.frame_counter & 1];
         back.fg_bitmap.blend(target, fg);
+    }
+
+    pub fn reverse(&mut self, target: Rect) {
+        let back = &mut self.buffers[self.frame_counter & 1];
+
+        let target = target.intersect(back.bg_bitmap.size.as_rect());
+        if target.is_empty() {
+            return;
+        }
+
+        let top = target.top as usize;
+        let bottom = target.bottom as usize;
+        let left = target.left as usize;
+        let right = target.right as usize;
+        let stride = back.bg_bitmap.size.width as usize;
+
+        for y in top..bottom {
+            let beg = y * stride + left;
+            let end = y * stride + right;
+            let bg = &mut back.bg_bitmap.data[beg..end];
+            let fg = &mut back.fg_bitmap.data[beg..end];
+            bg.swap_with_slice(fg);
+        }
     }
 
     pub fn replace_attr(&mut self, target: Rect, mask: Attributes, attr: Attributes) {
@@ -367,13 +391,6 @@ impl Framebuffer {
                             result.push_str("\x1b[4m");
                         } else {
                             result.push_str("\x1b[24m");
-                        }
-                    }
-                    if diff.reverse() {
-                        if attr.reverse() {
-                            result.push_str("\x1b[7m");
-                        } else {
-                            result.push_str("\x1b[27m");
                         }
                     }
                     last_attr = attr;
@@ -527,8 +544,8 @@ impl Framebuffer {
     }
 }
 
-pub fn mix(dst: u32, src: u32, balance: f32) -> u32 {
-    Bitmap::mix(dst, src, balance, 1.0 - balance)
+pub fn alpha_blend(dst: u32, src: u32) -> u32 {
+    Bitmap::alpha_blend(dst, src)
 }
 
 #[derive(Default)]
@@ -719,7 +736,7 @@ impl Bitmap {
                     } {}
                     let chunk_end = off;
 
-                    data[chunk_beg..chunk_end].fill(Self::mix(c, color, 1.0, 1.0));
+                    data[chunk_beg..chunk_end].fill(Self::alpha_blend(c, color));
 
                     off < end
                 } {}
@@ -727,18 +744,16 @@ impl Bitmap {
         }
     }
 
-    fn mix(dst: u32, src: u32, dst_balance: f32, src_balance: f32) -> u32 {
+    fn alpha_blend(dst: u32, src: u32) -> u32 {
         let src_r = Self::srgb_to_linear(src & 0xff);
         let src_g = Self::srgb_to_linear((src >> 8) & 0xff);
         let src_b = Self::srgb_to_linear((src >> 16) & 0xff);
         let src_a = (src >> 24) as f32 / 255.0f32;
-        let src_a = src_a * dst_balance;
 
         let dst_r = Self::srgb_to_linear(dst & 0xff);
         let dst_g = Self::srgb_to_linear((dst >> 8) & 0xff);
         let dst_b = Self::srgb_to_linear((dst >> 16) & 0xff);
         let dst_a = (dst >> 24) as f32 / 255.0f32;
-        let dst_a = dst_a * src_balance;
 
         let out_a = src_a + dst_a * (1.0f32 - src_a);
         let out_r = (src_r * src_a + dst_r * dst_a * (1.0f32 - src_a)) / out_a;
@@ -791,15 +806,10 @@ pub struct Attributes(u8);
 impl Attributes {
     pub const None: Attributes = Attributes(0);
     pub const Underlined: Attributes = Attributes(0b1);
-    pub const Reverse: Attributes = Attributes(0b10);
-    pub const All: Attributes = Attributes(0b11);
+    pub const All: Attributes = Attributes(0b1);
 
     pub const fn underlined(self) -> bool {
         self.0 & Self::Underlined.0 != 0
-    }
-
-    pub const fn reverse(self) -> bool {
-        self.0 & Self::Reverse.0 != 0
     }
 }
 

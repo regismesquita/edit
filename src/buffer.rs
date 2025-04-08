@@ -13,11 +13,14 @@
 //! The solution to the former is to keep line caches, which further complicates the architecture.
 //! There's no solution for the latter. However, there's a chance that the performance will still be sufficient.
 
-use crate::framebuffer::{Attributes, Framebuffer, IndexedColor};
+use crate::apperr;
+use crate::framebuffer::{Framebuffer, IndexedColor};
 use crate::helpers::{self, COORD_TYPE_SAFE_MAX, CoordType, Point, Rect};
+use crate::icu;
 use crate::memchr::memchr2;
-use crate::ucd::Document;
-use crate::{apperr, icu, sys, trust_me_bro, ucd};
+use crate::sys;
+use crate::trust_me_bro;
+use crate::ucd::{self, Document};
 use std::borrow::Cow;
 use std::cell::UnsafeCell;
 use std::collections::LinkedList;
@@ -25,11 +28,13 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Read as _;
 use std::io::Write as _;
-use std::mem::MaybeUninit;
-use std::ops::{Deref, DerefMut};
+use std::mem::{self, MaybeUninit};
+use std::ops::{Deref, DerefMut, Range};
 use std::path::Path;
+use std::ptr;
 use std::rc::Rc;
-use std::{mem, ptr, slice, str};
+use std::slice;
+use std::str;
 
 /// The margin template is used for line numbers.
 /// The max. line number we should ever expect is probably 64-bit,
@@ -110,6 +115,10 @@ struct ActiveEditLineInfo {
 pub enum CursorMovement {
     Grapheme,
     Word,
+}
+
+pub struct RenderResult {
+    pub visual_pos_x_max: CoordType,
 }
 
 #[derive(Clone)]
@@ -884,8 +893,9 @@ impl TextBuffer {
         // and double click on the "i" (= the cursor is in front of the "i").
         // It'll select "sup> in" but should only select 1 word of course.
         // Not sure what the issue is, but I think this approach is wrong in general.
-        let beg = self.cursor_move_delta_internal(self.cursor, CursorMovement::Word, -1);
-        let end = self.cursor_move_delta_internal(beg, CursorMovement::Word, 1);
+        let Range { start, end } = ucd::word_select(&self.buffer, self.cursor.offset);
+        let beg = self.cursor_move_to_offset_internal(self.cursor, start);
+        let end = self.cursor_move_to_offset_internal(beg, end);
         self.set_cursor_for_selection(end);
         self.set_selection(TextBufferSelection::Done {
             beg: beg.logical_pos,
@@ -1436,11 +1446,11 @@ impl TextBuffer {
         &mut self,
         origin: Point,
         destination: Rect,
-        show_cursor: bool,
+        focused: bool,
         fb: &mut Framebuffer,
-    ) {
+    ) -> Option<RenderResult> {
         if destination.is_empty() {
-            return;
+            return None;
         }
 
         let width = destination.width();
@@ -1450,6 +1460,7 @@ impl TextBuffer {
         let mut visualizer_buf = [0xE2, 0x90, 0x80]; // U+2400 in UTF8
         let mut line = String::new();
         let mut cursor = self.cursor_for_rendering.unwrap_or(self.cursor);
+        let mut visual_pos_x_max = 0;
 
         let [selection_beg, selection_end] = match self.selection {
             TextBufferSelection::None => [Point::MIN, Point::MIN],
@@ -1609,6 +1620,8 @@ impl TextBuffer {
 
                     global_off += chunk.len();
                 }
+
+                visual_pos_x_max = visual_pos_x_max.max(cursor_end.visual_pos.x);
             }
 
             fb.replace_text(
@@ -1619,21 +1632,23 @@ impl TextBuffer {
             );
 
             // Draw the selection on this line, if any.
-            if cursor_beg.logical_pos < selection_end && cursor_end.logical_pos > selection_beg {
+            if selection_beg <= cursor_end.logical_pos && selection_end >= cursor_beg.logical_pos {
                 // By default, we assume the entire line is selected.
                 let mut beg = 0;
                 let mut end = COORD_TYPE_SAFE_MAX;
                 let mut cursor = cursor_beg;
 
                 // The start of the selection is within this line. We need to update selection_beg.
-                if selection_beg > cursor_beg.logical_pos && selection_beg <= cursor_end.logical_pos
+                if selection_beg <= cursor_end.logical_pos
+                    && selection_beg >= cursor_beg.logical_pos
                 {
                     cursor = self.cursor_move_to_logical_internal(cursor, selection_beg);
                     beg = cursor.visual_pos.x;
                 }
 
                 // The end of the selection is within this line. We need to update selection_end.
-                if selection_end > cursor_beg.logical_pos && selection_end <= cursor_end.logical_pos
+                if selection_end <= cursor_end.logical_pos
+                    && selection_end >= cursor_beg.logical_pos
                 {
                     cursor = self.cursor_move_to_logical_internal(cursor, selection_end);
                     end = cursor.visual_pos.x;
@@ -1651,7 +1666,12 @@ impl TextBuffer {
                     bottom: top + 1,
                 };
 
-                fb.flip_attr(rect, Attributes::Reverse);
+                let bg = if focused {
+                    fb.indexed_alpha(IndexedColor::BrightBlue, 0x5f)
+                } else {
+                    fb.indexed_alpha(IndexedColor::BrightBlack, 0x3f)
+                };
+                fb.blend_bg(rect, bg);
             }
 
             cursor = cursor_end;
@@ -1684,7 +1704,7 @@ impl TextBuffer {
             }
         }
 
-        if show_cursor {
+        if focused {
             let mut x = self.cursor.visual_pos.x;
             let mut y = self.cursor.visual_pos.y;
 
@@ -1710,7 +1730,7 @@ impl TextBuffer {
             if text.contains(cursor) {
                 fb.set_cursor(cursor, self.overtype);
 
-                if self.line_highlight_enabled {
+                if self.line_highlight_enabled && selection_beg >= selection_end {
                     fb.blend_bg(
                         Rect {
                             left: destination.left,
@@ -1723,6 +1743,8 @@ impl TextBuffer {
                 }
             }
         }
+
+        Some(RenderResult { visual_pos_x_max })
     }
 
     /// Inserts `text` at the current cursor position.
@@ -1914,6 +1936,21 @@ impl TextBuffer {
         }
 
         out
+    }
+
+    pub fn extract_user_selection(&mut self, delete: bool) -> Option<Vec<u8>> {
+        if !self.has_selection() {
+            return None;
+        }
+
+        if let Some(search) = &self.search {
+            let search = unsafe { &*search.get() };
+            if search.selection_generation == self.selection_generation {
+                return None;
+            }
+        }
+
+        Some(self.extract_selection(delete))
     }
 
     pub fn selection_range(&self) -> Option<(ucd::UcdCursor, ucd::UcdCursor)> {

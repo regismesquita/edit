@@ -22,7 +22,7 @@
 // * For the focus path we can use the tree depth to O(1) check if the path contains the focus.
 
 use edit::buffer::{self, RcTextBuffer};
-use edit::framebuffer::{self, IndexedColor, mix};
+use edit::framebuffer::{self, IndexedColor, alpha_blend};
 use edit::helpers::*;
 use edit::input::{self, kbmod, vk};
 use edit::loc::{LocId, loc};
@@ -96,6 +96,7 @@ struct State {
     search_options: buffer::SearchOptions,
     search_success: bool,
 
+    wants_term_title_update: bool,
     wants_encoding_focus: bool,
     wants_encoding_change: StateEncodingChange,
     wants_indentation_focus: bool,
@@ -137,6 +138,7 @@ impl State {
             search_options: buffer::SearchOptions::default(),
             search_success: true,
 
+            wants_term_title_update: true,
             wants_encoding_focus: false,
             wants_encoding_change: StateEncodingChange::None,
             wants_indentation_focus: false,
@@ -152,6 +154,7 @@ impl State {
         self.buffer.set_ruler(ruler);
         self.filename = filename;
         self.path = Some(path);
+        self.wants_term_title_update = true;
     }
 }
 
@@ -182,7 +185,9 @@ fn run() -> apperr::Result<()> {
     let _sys_deinit = sys::init()?;
     let mut state = State::new()?;
 
-    handle_args(&mut state)?;
+    if handle_args(&mut state)? {
+        return Ok(());
+    }
 
     // sys::init() will switch the terminal to raw mode which prevents the user from pressing Ctrl+C.
     // Since the `read_file` call may hang for some reason, we must only call this afterwards.
@@ -195,16 +200,14 @@ fn run() -> apperr::Result<()> {
     let mut input_parser = input::Parser::new();
     let mut tui = Tui::new();
 
-    state.menubar_color_bg = mix(
+    state.menubar_color_bg = alpha_blend(
         tui.indexed(IndexedColor::Background),
-        tui.indexed(IndexedColor::Blue),
-        0.5,
+        tui.indexed_alpha(IndexedColor::BrightBlue, 0x7f),
     );
     state.menubar_color_fg = tui.contrasted(state.menubar_color_bg);
-    let floater_bg = mix(
-        tui.indexed(IndexedColor::Background),
-        tui.indexed(IndexedColor::Foreground),
-        0.7,
+    let floater_bg = alpha_blend(
+        tui.indexed_alpha(IndexedColor::Background, 0x33),
+        tui.indexed_alpha(IndexedColor::Foreground, 0xcc),
     );
     let floater_fg = tui.contrasted(floater_bg);
     tui.set_floater_default_bg(floater_bg);
@@ -271,44 +274,50 @@ fn run() -> apperr::Result<()> {
             break;
         }
 
-        #[cfg(feature = "debug-latency")]
+        #[cfg(not(target_os="uefi"))]
         {
             let mut output = tui.render();
 
-            // Print the number of passes and latency in the top right corner.
-            let time_end = std::time::Instant::now();
-            let status = time_end - time_beg;
-            let status = format!(
-                "{}P {}B {:.3}μs",
-                passes,
-                output.len(),
-                status.as_nanos() as f64 / 1000.0
-            );
+            if state.wants_term_title_update {
+                state.wants_term_title_update = false;
+                write_terminal_title(&mut output, &state.filename);
+            }
 
-            // "μs" is 3 bytes and 2 columns.
-            let cols = status.len() as i32 - 3 + 2;
+            #[cfg(feature = "debug-latency")]
+            {
+                // Print the number of passes and latency in the top right corner.
+                let time_end = std::time::Instant::now();
+                let status = time_end - time_beg;
+                let status = format!(
+                    "{}P {}B {:.3}μs",
+                    passes,
+                    output.len(),
+                    status.as_nanos() as f64 / 1000.0
+                );
 
-            // Since the status may shrink and grow, we may have to overwrite the previous one with whitespace.
-            let padding = (last_latency_width - cols).max(0);
+                // "μs" is 3 bytes and 2 columns.
+                let cols = status.len() as i32 - 3 + 2;
 
-            // To avoid moving the cursor, push and pop it onto the VT cursor stack.
-            _ = write!(
-                output,
-                "\x1b7\x1b[0;41;97m\x1b[1;{0}H{1:2$}{3}\x1b8",
-                tui.size().width - cols - padding + 1,
-                "",
-                padding as usize,
-                status
-            );
+                // Since the status may shrink and grow, we may have to overwrite the previous one with whitespace.
+                let padding = (last_latency_width - cols).max(0);
 
-            last_latency_width = cols;
+                // To avoid moving the cursor, push and pop it onto the VT cursor stack.
+                _ = write!(
+                    output,
+                    "\x1b7\x1b[0;41;97m\x1b[1;{0}H{1:2$}{3}\x1b8",
+                    tui.size().width - cols - padding + 1,
+                    "",
+                    padding as usize,
+                    status
+                );
+
+                last_latency_width = cols;
+                sys::write_stdout(&output);
+            }
+
             sys::write_stdout(&output);
         }
-        #[cfg(all(not(target_os="uefi"), not(feature = "debug-latency")))]
-        {
-            let output = tui.render();
-            sys::write_stdout(&output);
-        }
+
         #[cfg(target_os="uefi")]
         tui.render_sys();
     }
@@ -316,17 +325,18 @@ fn run() -> apperr::Result<()> {
     Ok(())
 }
 
-fn handle_args(state: &mut State) -> apperr::Result<()> {
+// Returns true if the application should exit early.
+fn handle_args(state: &mut State) -> apperr::Result<bool> {
     let cwd = std::env::current_dir()?;
 
     // The best CLI argument parser in the world.
     if let Some(path) = std::env::args_os().nth(1) {
         if path == "-h" || path == "--help" || (cfg!(windows) && path == "/?") {
             print_help();
-            return Ok(());
+            return Ok(true);
         } else if path == "-v" || path == "--version" {
             print_version();
-            return Ok(());
+            return Ok(true);
         } else if path == "-" {
             // We'll check for a redirected stdin no matter what, so we can just ignore "-".
         } else {
@@ -369,7 +379,7 @@ fn handle_args(state: &mut State) -> apperr::Result<()> {
         }
     }
 
-    Ok(())
+    Ok(false)
 }
 
 fn print_help() {
@@ -569,10 +579,8 @@ fn draw_search(ctx: &mut Context, state: &mut State) {
 
         // If the selection is empty, focus the search input field.
         // Otherwise, focus the replace input field, if it exists.
-        if state.buffer.has_selection() {
-            let selection = state.buffer.extract_selection(false);
-            let selection = string_from_utf8_lossy_owned(selection);
-            state.search_needle = selection;
+        if let Some(selection) = state.buffer.extract_user_selection(false) {
+            state.search_needle = string_from_utf8_lossy_owned(selection);
             focus = state.wants_search.kind;
         }
     }
@@ -1081,6 +1089,7 @@ fn draw_file_picker(ctx: &mut Context, state: &mut State) {
             ctx.attr_padding(Rect::three(1, 2, 1));
 
             ctx.table_begin("choices");
+            ctx.inherit_focus();
             ctx.attr_padding(Rect::three(0, 2, 1));
             ctx.attr_position(Position::Center);
             ctx.table_set_cell_gap(Size {
@@ -1089,9 +1098,11 @@ fn draw_file_picker(ctx: &mut Context, state: &mut State) {
             });
             {
                 ctx.table_next_row();
+                ctx.inherit_focus();
 
                 save = ctx.button("yes", Overflow::Clip, loc(LocId::Yes));
-                ctx.focus_on_first_present();
+                ctx.inherit_focus();
+
                 if ctx.button("no", Overflow::Clip, loc(LocId::No)) {
                     state.file_picker_overwrite_warning = None;
                 }
@@ -1340,6 +1351,7 @@ fn draw_unsaved_changes_dialog(ctx: &mut Context) -> UnsavedChangesDialogResult 
         ctx.attr_padding(Rect::three(1, 2, 1));
 
         ctx.table_begin("choices");
+        ctx.inherit_focus();
         ctx.attr_padding(Rect::three(0, 2, 1));
         ctx.attr_position(Position::Center);
         ctx.table_set_cell_gap(Size {
@@ -1348,11 +1360,12 @@ fn draw_unsaved_changes_dialog(ctx: &mut Context) -> UnsavedChangesDialogResult 
         });
         {
             ctx.table_next_row();
+            ctx.inherit_focus();
 
             if ctx.button("yes", Overflow::Clip, loc(LocId::UnsavedChangesDialogYes)) {
                 result = UnsavedChangesDialogResult::Save;
             }
-            ctx.focus_on_first_present();
+            ctx.inherit_focus();
             if ctx.button("no", Overflow::Clip, loc(LocId::UnsavedChangesDialogNo)) {
                 result = UnsavedChangesDialogResult::Discard;
             }
@@ -1442,7 +1455,7 @@ fn draw_error_log(ctx: &mut Context, state: &mut State) {
         }
         ctx.attr_padding(Rect::three(1, 2, 1));
         ctx.attr_position(Position::Center);
-        ctx.focus_on_first_present();
+        ctx.inherit_focus();
     }
     if ctx.modal_end() {
         state.error_log_count = 0;
@@ -1481,13 +1494,23 @@ fn set_vt_modes() -> RestoreModes {
     RestoreModes
 }
 
+#[cold]
+fn write_terminal_title(output: &mut String, filename: &str) {
+    output.push_str("\x1b]0;edit");
+    if !filename.is_empty() {
+        output.push(' ');
+        output.push_str(&sanitize_control_chars(filename));
+    }
+    output.push('\x07');
+}
+
 struct RestoreModes;
 
 impl Drop for RestoreModes {
     fn drop(&mut self) {
         // Same as in the beginning but in the reverse order.
         // It also includes DECSCUSR 0 to reset the cursor style and DECTCEM to show the cursor.
-        sys::write_stdout("\x1b[?1002;1006;2004l\x1b[?1049l\x1b[0 q\x1b[?25h");
+        sys::write_stdout("\x1b[0 q\x1b[?25h\x1b]0;\x07\x1b[?1002;1006;2004l\x1b[?1049l");
     }
 }
 

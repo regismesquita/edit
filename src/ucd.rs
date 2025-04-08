@@ -2,6 +2,7 @@ use crate::helpers::{self, CoordType, Point};
 use crate::memchr::{memchr2, memrchr2};
 use crate::ucd_gen::*;
 use crate::utf8::Utf8Chars;
+use std::ops::Range;
 
 /// An abstraction over potentially chunked text containers.
 pub trait Document {
@@ -82,7 +83,7 @@ impl<'doc> MeasurementConfig<'doc> {
     }
 
     pub fn with_tab_size(mut self, tab_size: CoordType) -> Self {
-        self.tab_size = tab_size;
+        self.tab_size = tab_size.max(1);
         self
     }
 
@@ -375,6 +376,7 @@ impl<'doc> MeasurementConfig<'doc> {
 
                 loop {
                     let props_current_cluster = props_next_cluster;
+                    let mut props_last_char;
                     let mut offset_next_cluster;
                     let mut state = 0;
                     let mut width = 0;
@@ -394,6 +396,7 @@ impl<'doc> MeasurementConfig<'doc> {
                         // records the offset of the next character after the returned one, we need
                         // to save the offset of the previous `chunk_iter` before calling `next()`.
                         // Similar applies to the width.
+                        props_last_char = props_next_cluster;
                         offset_next_cluster = chunk_range.start + chunk_iter.offset();
                         width +=
                             ucd_grapheme_cluster_character_width(props_next_cluster) as CoordType;
@@ -427,6 +430,18 @@ impl<'doc> MeasurementConfig<'doc> {
 
                     // The max. width of a terminal cell is 2.
                     width = width.min(2);
+
+                    // Tabs require special handling because they can have a variable width.
+                    if props_last_char == ucd_tab_properties() {
+                        // `tab_size` is clamped to >= 1 at the start of this method.
+                        unsafe { std::hint::assert_unchecked(tab_size >= 1) };
+                        width = tab_size - (column % tab_size);
+                    }
+
+                    // Hard wrap: Both the logical and visual position advance by one line.
+                    if props_last_char == ucd_linefeed_properties() {
+                        break;
+                    }
 
                     visual_pos_x_lookahead += width;
 
@@ -585,11 +600,12 @@ impl WordNavigation for WordForward<'_> {
     fn skip_newline(&mut self) {
         // We can rely on the fact that the document does not split graphemes across chunks.
         // = If there's a newline it's wholly contained in this chunk.
-        if self.chunk_off < self.chunk.len() && self.chunk[self.chunk_off] == b'\r' {
-            self.chunk_off += 1;
-        }
-        if self.chunk_off < self.chunk.len() && self.chunk[self.chunk_off] == b'\n' {
-            self.chunk_off += 1;
+        // Unlike with `WordBackward`, we can't check for CR and LF separately as only a CR followed
+        // by a LF is a newline. A lone CR in the document is just a regular control character.
+        self.chunk_off += match self.chunk.get(self.chunk_off) {
+            Some(&b'\n') => 1,
+            Some(&b'\r') if self.chunk.get(self.chunk_off + 1) == Some(&b'\n') => 2,
+            _ => 0,
         }
     }
 
@@ -679,6 +695,77 @@ impl WordNavigation for WordBackward<'_> {
     fn offset(&self) -> usize {
         self.offset - self.chunk.len() + self.chunk_off
     }
+}
+
+/// Returns the offset range of the "word" at the given offset.
+/// Does not cross newlines. Works similar to VS Code.
+pub fn word_select(doc: &dyn Document, offset: usize) -> Range<usize> {
+    let mut beg = offset;
+    let mut end = offset;
+    let mut class = CharClass::Newline;
+
+    let mut chunk = doc.read_forward(end);
+    if !chunk.is_empty() {
+        // Not at the end of the document? Great!
+        // We default to using the next char as the class, because in terminals
+        // the cursor is usually always to the left of the cell you clicked on.
+        class = WORD_CLASSIFIER[chunk[0] as usize];
+
+        let mut chunk_off = 0;
+
+        // Select the word, unless we hit a newline.
+        if class != CharClass::Newline {
+            loop {
+                chunk_off += 1;
+                end += 1;
+
+                if chunk_off >= chunk.len() {
+                    chunk = doc.read_forward(end);
+                    chunk_off = 0;
+                    if chunk.is_empty() {
+                        break;
+                    }
+                }
+
+                if WORD_CLASSIFIER[chunk[chunk_off] as usize] != class {
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut chunk = doc.read_backward(beg);
+    if !chunk.is_empty() {
+        let mut chunk_off = chunk.len();
+
+        // If we failed to determine the class, because we hit the end of the document
+        // or a newline, we fall back to using the previous character, of course.
+        if class == CharClass::Newline {
+            class = WORD_CLASSIFIER[chunk[chunk_off - 1] as usize];
+        }
+
+        // Select the word, unless we hit a newline.
+        if class != CharClass::Newline {
+            loop {
+                if WORD_CLASSIFIER[chunk[chunk_off - 1] as usize] != class {
+                    break;
+                }
+
+                chunk_off -= 1;
+                beg -= 1;
+
+                if chunk_off == 0 {
+                    chunk = doc.read_backward(beg);
+                    chunk_off = chunk.len();
+                    if chunk.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    beg..end
 }
 
 // TODO: This code could be optimized by replacing memchr with manual line counting.
