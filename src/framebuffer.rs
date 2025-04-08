@@ -502,7 +502,7 @@ impl Framebuffer {
                         }
                     }
                     */
-                    if diff.reverse() {
+                    if diff.underlined() {
                         cch = true;
                     }
                     last_attr = attr;
@@ -510,7 +510,7 @@ impl Framebuffer {
 
                 if cch {
                     let (mut f, mut b) = (last_fg, last_bg);
-                    if attr.reverse() {
+                    if attr.underlined() {
                         std::mem::swap(&mut f, &mut b);
                     }
                     sys::set_color(f, b);
