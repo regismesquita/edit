@@ -2308,7 +2308,7 @@ impl Context<'_, '_> {
         self.attr_focusable();
         self.attr_padding(Rect::two(0, 1));
 
-        if self.consume_shortcut(/*kbmod::ALT | */InputKey::new(accelerator as u32)) {
+        if self.consume_shortcut(kbmod::ALT | InputKey::new(accelerator as u32)) {
             self.steal_focus();
         }
 
