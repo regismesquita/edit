@@ -5,16 +5,51 @@ use r_efi::efi;
 use std::ffi::{CStr, c_void};
 use std::fmt::Write;
 use std::fs::File;
+use std::mem::MaybeUninit;
+use std::os::uefi as uefi_std;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+use std::time;
+use uefi::boot::{OpenProtocolAttributes, ScopedProtocol};
 use uefi::proto::console::text::{Color, Key};
 use uefi::{Handle, ResultExt};
-use std::os::uefi as uefi_std;
-use std::time;
 
 pub fn preferred_languages() -> Vec<String> {
     vec!["en".to_string()]
 }
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct KeyState {
+    pub shift_state: u32,
+    pub toggle_state: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(C)]
+pub struct KeyData {
+    pub key: uefi_raw::protocol::console::InputKey,
+    pub state: KeyState,
+}
+
+#[derive(Debug)]
+#[repr(C)]
+pub struct SimpleTextInputProtocolEx {
+    pub reset_ex:
+        unsafe extern "efiapi" fn(this: *mut Self, extended_verification: bool) -> uefi_raw::Status,
+    pub read_key_stroke_ex:
+        unsafe extern "efiapi" fn(this: *mut Self, key: *mut KeyData) -> uefi_raw::Status,
+    pub wait_for_key_ex: uefi_raw::Event,
+}
+
+impl SimpleTextInputProtocolEx {
+    pub const GUID: uefi_raw::Guid = uefi_raw::guid!("dd9e7534-7762-4698-8c14-f58517a625aa");
+}
+
+#[derive(Debug)]
+#[repr(transparent)]
+#[uefi::proto::unsafe_protocol(SimpleTextInputProtocolEx::GUID)]
+pub struct SimpleTextInputEx(SimpleTextInputProtocolEx);
 
 pub fn init() -> apperr::Result<()> {
     let st = uefi_std::env::system_table();
@@ -57,14 +92,12 @@ struct State {
     inject_resize: bool,
     last_text: [u8; 4],
     last_text_len: usize,
-    modifier: Option<InputKeyMod>,
 }
 
 static mut STATE: State = State {
     inject_resize: false,
     last_text: [0; 4],
     last_text_len: 0,
-    modifier: Some(kbmod::NONE),
 };
 
 pub fn read_stdin(_timeout: time::Duration) -> Option<String> {
@@ -72,14 +105,112 @@ pub fn read_stdin(_timeout: time::Duration) -> Option<String> {
     None
 }
 
-fn _wait_and_read_single_key() -> Option<Key> {
-    uefi::system::with_stdin(|i| {
-        let mut events = [i.wait_for_key_event().unwrap()];
-        uefi::boot::wait_for_event(&mut events)
-            .discard_errdata()
-            .ok()?;
-        i.read_key().ok()
-    })?
+fn wait_and_read_single_key_ex() -> Option<KeyData> {
+    let mut p = unsafe {
+        uefi::boot::open_protocol::<SimpleTextInputEx>(
+            uefi::boot::OpenProtocolParams {
+                handle: uefi::Handle::from_ptr(
+                    uefi::table::system_table_raw()
+                        .unwrap()
+                        .as_ref()
+                        .stdin_handle,
+                )
+                .unwrap(),
+                agent: uefi::boot::image_handle(),
+                controller: None,
+            },
+            OpenProtocolAttributes::GetProtocol,
+        )
+    }
+    .ok()?;
+    let mut events = [unsafe { uefi::Event::from_ptr(p.0.wait_for_key_ex) }?];
+    uefi::boot::wait_for_event(&mut events).ok()?;
+    let mut key = MaybeUninit::<KeyData>::uninit();
+    match unsafe { (p.0.read_key_stroke_ex)(&mut p.0, key.as_mut_ptr()) } {
+        uefi_raw::Status::NOT_READY => None,
+        _ => Some(unsafe { key.assume_init() }),
+    }
+}
+
+#[allow(static_mut_refs)]
+fn transform_single_key(key: &KeyData) -> Option<Input<'static>> {
+    const LUT: [u8; 0x18] = [
+        0,
+        vk::UP.value() as u8,     // 1
+        vk::DOWN.value() as u8,   // 2
+        vk::RIGHT.value() as u8,  // 3
+        vk::LEFT.value() as u8,   // 4
+        vk::HOME.value() as u8,   // 5
+        vk::END.value() as u8,    // 6
+        vk::INSERT.value() as u8, // 7
+        vk::DELETE.value() as u8, // 8
+        vk::PRIOR.value() as u8,  // 9
+        vk::NEXT.value() as u8,   // 10
+        vk::F1.value() as u8,     // 11
+        vk::F2.value() as u8,     // 12
+        vk::F3.value() as u8,     // 13
+        vk::F4.value() as u8,     // 14
+        vk::F5.value() as u8,     // 15
+        vk::F6.value() as u8,     // 16
+        vk::F7.value() as u8,     // 17
+        vk::F8.value() as u8,     // 18
+        vk::F9.value() as u8,     // 19
+        vk::F10.value() as u8,    // 20
+        vk::F11.value() as u8,    // 21
+        vk::F12.value() as u8,    // 22
+        vk::ESCAPE.value() as u8, // 23
+    ];
+    const LUT_LEN: i32 = LUT.len() as i32;
+
+    let mut m = kbmod::NONE;
+    if (key.state.shift_state & 0x80000000) != 0 {
+        m |= if (key.state.shift_state & 0x3) != 0 {
+            kbmod::SHIFT
+        } else {
+            kbmod::NONE
+        };
+        m |= if (key.state.shift_state & 0xc) != 0 {
+            kbmod::CTRL
+        } else {
+            kbmod::NONE
+        };
+        m |= if (key.state.shift_state & 0x30) != 0 {
+            kbmod::ALT
+        } else {
+            kbmod::NONE
+        };
+    }
+
+    unsafe {
+        match key.key.scan_code as i32 {
+            0 => {
+                if m == kbmod::NONE && key.key.unicode_char >= 0x20 {
+                    let v = char::from_u32(key.key.unicode_char as u32)?;
+                    let s: String = v.to_string();
+                    STATE.last_text_len = s.len();
+                    STATE.last_text[..STATE.last_text_len]
+                        .copy_from_slice(&s.as_bytes()[..STATE.last_text_len]);
+                    Some(Input::Text(InputText {
+                        text: str::from_utf8_unchecked(&STATE.last_text[..STATE.last_text_len]),
+                        bracketed: false,
+                    }))
+                } else {
+                    Some(Input::Keyboard(
+                        InputKey::from_ascii(char::from_u32(key.key.unicode_char as u32)?)
+                            .unwrap_or_else(|| InputKey::new(key.key.unicode_char as u32))
+                            .with_modifiers(m),
+                    ))
+                }
+            }
+            1..LUT_LEN => Some(Input::Keyboard(
+                InputKey::new(LUT[key.key.scan_code as usize] as u32).with_modifiers(m),
+            )),
+            _ => {
+                println!("UNKNOWN SCAN {:x}\r\n", key.key.scan_code);
+                None
+            }
+        }
+    }
 }
 
 #[allow(static_mut_refs)]
@@ -93,88 +224,7 @@ pub fn read_input() -> Option<Input<'static>> {
                 height: t.1 as i32,
             }))
         } else {
-            match _wait_and_read_single_key()? {
-                uefi::proto::console::text::Key::Printable(k) => {
-                    if k.is_ascii() {
-                        let v: char = k.into();
-                        match v {
-                            '?' => {
-                                STATE.modifier = Some(kbmod::CTRL);
-                                None
-                            }
-                            '/' => {
-                                STATE.modifier = Some(kbmod::ALT);
-                                None
-                            }
-                            '\t' => Some(Input::Keyboard(InputKey::new(vk::TAB.value()))),
-                            '\r' => Some(Input::Keyboard(InputKey::new(vk::RETURN.value()))),
-                            '\n' => Some(Input::Keyboard(InputKey::new(vk::RETURN.value()))),
-                            '\x08' => Some(Input::Keyboard(InputKey::new(vk::BACK.value()))),
-                            _ => match STATE.modifier {
-                                Some(m) => {
-                                    STATE.modifier = None;
-                                    Some(Input::Keyboard(
-                                        InputKey::from_ascii(v)?.with_modifiers(m),
-                                    ))
-                                }
-                                _ => {
-                                    let s: String = v.to_string();
-                                    STATE.last_text_len = s.len();
-                                    STATE.last_text[..STATE.last_text_len]
-                                        .copy_from_slice(&s.as_bytes()[..STATE.last_text_len]);
-                                    Some(Input::Text(InputText {
-                                        text: str::from_utf8_unchecked(
-                                            &STATE.last_text[..STATE.last_text_len],
-                                        ),
-                                        bracketed: false,
-                                    }))
-                                }
-                            },
-                        }
-                    } else {
-                        println!("UNKNOWN KEY {:x}\r\n", u16::from(k));
-                        None
-                    }
-                }
-                uefi::proto::console::text::Key::Special(sc) => {
-                    const LUT: [u8; 0x18] = [
-                        0,
-                        vk::UP.value() as u8,     // 1
-                        vk::DOWN.value() as u8,   // 2
-                        vk::RIGHT.value() as u8,  // 3
-                        vk::LEFT.value() as u8,   // 4
-                        vk::HOME.value() as u8,   // 5
-                        vk::END.value() as u8,    // 6
-                        vk::INSERT.value() as u8, // 7
-                        vk::DELETE.value() as u8, // 8
-                        vk::PRIOR.value() as u8,  // 9
-                        vk::NEXT.value() as u8,   // 10
-                        vk::F1.value() as u8,     // 11
-                        vk::F2.value() as u8,     // 12
-                        vk::F3.value() as u8,     // 13
-                        vk::F4.value() as u8,     // 14
-                        vk::F5.value() as u8,     // 15
-                        vk::F6.value() as u8,     // 16
-                        vk::F7.value() as u8,     // 17
-                        vk::F8.value() as u8,     // 18
-                        vk::F9.value() as u8,     // 19
-                        vk::F10.value() as u8,    // 20
-                        vk::F11.value() as u8,    // 21
-                        vk::F12.value() as u8,    // 22
-                        vk::ESCAPE.value() as u8, // 23
-                    ];
-                    const LUT_LEN: i32 = LUT.len() as i32;
-                    match sc.0 as i32 {
-                        0..LUT_LEN => {
-                            Some(Input::Keyboard(InputKey::new(LUT[sc.0 as usize] as u32)))
-                        }
-                        _ => {
-                            println!("UNKNOWN SCAN {:x}\r\n", sc.0);
-                            None
-                        }
-                    }
-                }
-            }
+            transform_single_key(&wait_and_read_single_key_ex()?)
         }
     }
 }

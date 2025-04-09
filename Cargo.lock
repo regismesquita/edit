@@ -187,6 +187,7 @@ dependencies = [
  "qemu-exit",
  "r-efi",
  "uefi",
+ "uefi-raw",
  "windows-sys",
 ]
 
