@@ -92,14 +92,15 @@ pub fn init() -> apperr::Result<()> {
 
     //let u = CString16::try_from("hello world\r\n").unwrap();
     //let _ = uefi::system::with_stdout(|o| o.output_string(&u));;
-    write_stdout("Bootstrap done\r\n");
 
+    /*
     uefi::system::with_stdout(|o| {
         let m = o.modes().last();
         if m.is_some() {
             o.set_mode(m.unwrap());
         }
     });
+    */
 
     Ok({})
 }
@@ -116,7 +117,7 @@ pub fn inject_window_size_into_stdin() {
 
 fn get_window_size() -> (u16, u16) {
     match uefi::system::with_stdout(|o| o.current_mode().unwrap()) {
-        Some(t) => ((t.columns() - 1) as u16, t.rows() as u16),
+        Some(t) => (t.columns() as u16, t.rows() as u16 - 1),
         None => (80, 25),
     }
 }
@@ -177,10 +178,23 @@ pub fn read_input() -> Option<Input<'static>> {
                         if k.is_ascii() {
                             let v: char = k.into();
                             match v {
+                                '?' => {
+                                    STATE.modifier = Some(kbmod::CTRL);
+                                    None
+                                }
                                 '/' => {
                                     STATE.modifier = Some(kbmod::ALT);
                                     None
                                 }
+                                '\r' => Some(Input::Keyboard(
+                                    InputKey::new(vk::RETURN.value())
+                                )),
+                                '\n' => Some(Input::Keyboard(
+                                    InputKey::new(vk::RETURN.value())
+                                )),
+                                '\x08' => Some(Input::Keyboard(
+                                    InputKey::new(vk::BACK.value())
+                                )),
                                 _ => {
                                     let s: String = v.to_string();
                                     STATE.last_text = s.into();
@@ -287,6 +301,14 @@ pub fn set_color(fg: u32, bg: u32) {
     let b = color_to_index(bg) & 0b111; // cut off the intensity flag
     uefi::system::with_stdout(|o| o.set_color(index_to_uefi(f), index_to_uefi(b)));
     //write_stdout(format!("FG {:x} -> {:x} BG {:x} -> {:x}... ", fg, f, bg, b).as_str());
+}
+
+pub fn reset() {
+    uefi::system::with_stdout(|o| o.clear());
+}
+
+pub fn set_cursor(en: bool) {
+    uefi::system::with_stdout(|o| o.enable_cursor(en));
 }
 
 pub fn write_stdout(text: &str) {

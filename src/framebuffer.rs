@@ -452,6 +452,7 @@ impl Framebuffer {
 
         sys::move_cursor(0, 0);
         sys::set_color(last_fg, last_bg);
+        sys::reset();
         for y in 0..back.text.size.height {
             // SAFETY: The only thing that changes the size of these containers,
             // is the reset() method and it always resets front/back to the same size.
@@ -464,7 +465,7 @@ impl Framebuffer {
             let mut cfg = ucd::MeasurementConfig::new(&line_bytes);
             let mut chunk_end = 0;
 
-            sys::move_cursor(0, y as usize + 1);
+            sys::move_cursor(0, y as usize);
 
             while {
                 let bg = back_bg[chunk_end];
@@ -508,8 +509,10 @@ impl Framebuffer {
                     last_attr = attr;
                 }
 
-                if cch {
-                    let (mut f, mut b) = (last_fg, last_bg);
+                //if cch {
+                {
+                    //let (mut f, mut b) = (last_fg, last_bg);
+                    let (mut f, mut b) = (fg, bg);
                     if attr.underlined() {
                         std::mem::swap(&mut f, &mut b);
                     }
@@ -537,9 +540,11 @@ impl Framebuffer {
             // DECSCUSR to set the cursor style.
             // DECTCEM to show the cursor.
             sys::move_cursor(back.cursor.pos.x as usize, back.cursor.pos.y as usize);
+            sys::set_cursor(true);
         } else {
             // DECTCEM to hide the cursor.
             //result.push_str("\x1b[?25l");
+            sys::set_cursor(false);
         }
     }
 }
