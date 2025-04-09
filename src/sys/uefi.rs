@@ -186,6 +186,9 @@ pub fn read_input() -> Option<Input<'static>> {
                                     STATE.modifier = Some(kbmod::ALT);
                                     None
                                 }
+                                '\t' => Some(Input::Keyboard(
+                                    InputKey::new(vk::TAB.value())
+                                )),
                                 '\r' => Some(Input::Keyboard(
                                     InputKey::new(vk::RETURN.value())
                                 )),
