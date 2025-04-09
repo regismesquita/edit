@@ -435,11 +435,17 @@ impl Framebuffer {
 
     pub fn render_sys(&mut self) {
         let idx = self.frame_counter & 1;
-        let back = unsafe {
+        let (back, front) = unsafe {
             let ptr = self.buffers.as_mut_ptr();
             let back = &mut *ptr.add(idx);
-            back
+            let front = &*ptr.add(1 - idx);
+            (back, front)
         };
+
+        let mut front_lines = front.text.lines.iter(); // hahaha
+        let mut front_bgs = front.bg_bitmap.iter();
+        let mut front_fgs = front.fg_bitmap.iter();
+        let mut front_attrs = front.attributes.iter();
 
         let mut back_lines = back.text.lines.iter();
         let mut back_bgs = back.bg_bitmap.iter();
@@ -450,16 +456,28 @@ impl Framebuffer {
         let mut last_fg = self.indexed(IndexedColor::Foreground);
         let mut last_attr = Attributes::None;
 
-        sys::move_cursor(0, 0);
-        sys::set_color(last_fg, last_bg);
-        sys::reset();
-        for y in 0..back.text.size.height {
+        for y in 0..front.text.size.height {
             // SAFETY: The only thing that changes the size of these containers,
             // is the reset() method and it always resets front/back to the same size.
+            let front_line = unsafe { front_lines.next().unwrap_unchecked() };
+            let front_bg = unsafe { front_bgs.next().unwrap_unchecked() };
+            let front_fg = unsafe { front_fgs.next().unwrap_unchecked() };
+            let front_attr = unsafe { front_attrs.next().unwrap_unchecked() };
+
             let back_line = unsafe { back_lines.next().unwrap_unchecked() };
             let back_bg = unsafe { back_bgs.next().unwrap_unchecked() };
             let back_fg = unsafe { back_fgs.next().unwrap_unchecked() };
             let back_attr = unsafe { back_attrs.next().unwrap_unchecked() };
+
+            // TODO: Ideally, we should properly diff the contents and so if
+            // only parts of a line change, we should only update those parts.
+            if front_line == back_line
+                && front_bg == back_bg
+                && front_fg == back_fg
+                && front_attr == back_attr
+            {
+                continue;
+            }
 
             let line_bytes = back_line.as_bytes();
             let mut cfg = ucd::MeasurementConfig::new(&line_bytes);
