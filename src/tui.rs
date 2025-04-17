@@ -596,6 +596,30 @@ impl Tui {
         self.framebuffer.blend_bg(outer_clipped, node.attributes.bg);
         self.framebuffer.blend_fg(outer_clipped, node.attributes.fg);
 
+        // Handle the modal title all at once, so that its titlebar can be reversed if necessary.
+        // We could render the text during the below match, but we need the text to measure the
+        // width of the title bar anyway...
+        if let NodeContent::Modal(title) = &node.content {
+            let mut fill = String::new();
+            fill.push_str("┤ ");
+            fill.push_str(title);
+            fill.push_str(" ├");
+
+            let mut bar = self.framebuffer.replace_text(
+                outer_clipped.top,
+                outer_clipped.left + 1,
+                outer_clipped.right - 2,
+                &fill,
+            );
+            bar.left += 1;
+            bar.right -= 1;
+
+            self.framebuffer
+                .blend_bg(bar, self.indexed(IndexedColor::BrightBlue));
+            self.framebuffer
+                .blend_fg(bar, self.indexed(IndexedColor::BrightWhite));
+        }
+
         if node.attributes.reverse {
             self.framebuffer.reverse(outer_clipped);
         }
@@ -607,14 +631,7 @@ impl Tui {
         }
 
         match &mut node.content {
-            NodeContent::Modal(title) => {
-                self.framebuffer.replace_text(
-                    node.outer.top,
-                    node.outer.left + 2,
-                    node.outer.right - 1,
-                    title,
-                );
-            }
+            NodeContent::Modal(_title) => (), // handled above
             NodeContent::Text(content) => {
                 if !inner_clipped.is_empty() {
                     if content.overflow != Overflow::Clip
@@ -1379,7 +1396,7 @@ impl<'a> Context<'a, '_> {
         self.focus_on_first_present();
 
         let mut last_node = self.tree.last_node.borrow_mut();
-        last_node.content = NodeContent::Modal(arena_format!(self.arena(), " {} ", title));
+        last_node.content = NodeContent::Modal(ArenaString::from_str(self.arena(), title));
         self.last_modal = Some(self.tree.last_node);
     }
 
