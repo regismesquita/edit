@@ -169,6 +169,12 @@ pub type TextBufferCell = SemiRefCell<TextBuffer>;
 /// the given text buffer(s) until after the layout process.
 pub type RcTextBuffer = Rc<TextBufferCell>;
 
+#[derive(PartialEq)]
+pub enum ViMode {
+    Insert,
+    Normal,
+}
+
 /// A text buffer for a text editor.
 pub struct TextBuffer {
     buffer: GapBuffer,
@@ -207,6 +213,8 @@ pub struct TextBuffer {
     overtype: bool,
 
     wants_cursor_visibility: bool,
+
+    pub vi_mode: ViMode,
 }
 
 impl TextBuffer {
@@ -253,6 +261,8 @@ impl TextBuffer {
             overtype: false,
 
             wants_cursor_visibility: false,
+
+            vi_mode: ViMode::Normal,
         })
     }
 

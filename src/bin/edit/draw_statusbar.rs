@@ -163,10 +163,10 @@ pub fn draw_statusbar(ctx: &mut Context, state: &mut State) {
         // because the vi_mode output will typically be larger than the cursor
         // position output, meaning that the larger vi_mode will visually
         // contain the smaller cursor position.
-        ctx.label(
-            "vi_mode",
-            "--insert--"
-        );
+        // ctx.label(
+        //     "vi_mode",
+        //     "--insert--"
+        // );
 
         #[cfg(any(feature = "debug-layout", feature = "debug-latency"))]
         ctx.label(
