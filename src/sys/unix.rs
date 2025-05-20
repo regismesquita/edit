@@ -6,6 +6,20 @@
 //! Read the `windows` module for reference.
 //! TODO: This reminds me that the sys API should probably be a trait.
 
+// Compatibility shims for non-Linux platforms
+#[cfg(not(target_os = "linux"))]
+mod compat {
+    use libc::{c_int, pollfd, EACCES};
+    pub use libc::poll as ppoll;
+    pub unsafe fn __errno_location() -> *mut c_int {
+        libc::__error()
+    }
+    pub const ELIBACC: c_int = EACCES;
+}
+
+#[cfg(not(target_os = "linux"))]
+use compat::*;
+
 use std::ffi::{CStr, c_int, c_void};
 use std::fs::{self, File};
 use std::mem::{self, MaybeUninit};
@@ -199,7 +213,9 @@ pub fn read_stdin(arena: &Arena, mut timeout: time::Duration) -> Option<ArenaStr
                     tv_sec: timeout.as_secs() as libc::time_t,
                     tv_nsec: timeout.subsec_nanos() as libc::c_long,
                 };
-                let ret = libc::ppoll(&mut pollfd, 1, &ts, null());
+                // Emulate ppoll with poll on non-Linux platforms (ignoring sigmask)
+                let timeout_ms = (ts.tv_sec as c_int) * 1000 + (ts.tv_nsec / 1_000_000) as c_int;
+                let ret = libc::poll(&mut pollfd, 1, timeout_ms);
                 if ret < 0 {
                     return None; // Error? Let's assume it's an EOF.
                 }
@@ -225,7 +241,7 @@ pub fn read_stdin(arena: &Arena, mut timeout: time::Duration) -> Option<ArenaStr
                 return None; // EOF
             }
             if ret < 0 {
-                match *libc::__errno_location() {
+                match *__errno_location() {
                     libc::EINTR if STATE.inject_resize => break,
                     libc::EAGAIN if timeout == time::Duration::ZERO => break,
                     libc::EINTR | libc::EAGAIN => {}
@@ -304,7 +320,7 @@ pub fn write_stdout(text: &str) {
             continue;
         }
 
-        let err = unsafe { *libc::__errno_location() };
+        let err = unsafe { *__errno_location() };
         if err != libc::EINTR {
             return;
         }
@@ -407,7 +423,7 @@ pub unsafe fn virtual_commit(base: NonNull<u8>, size: usize) -> apperr::Result<(
 unsafe fn load_library(name: &CStr) -> apperr::Result<NonNull<c_void>> {
     unsafe {
         NonNull::new(libc::dlopen(name.as_ptr(), libc::RTLD_LAZY))
-            .ok_or_else(|| errno_to_apperr(libc::ELIBACC))
+            .ok_or_else(|| errno_to_apperr(ELIBACC))
     }
 }
 
@@ -423,7 +439,7 @@ pub unsafe fn get_proc_address<T>(handle: NonNull<c_void>, name: &CStr) -> apper
     unsafe {
         let sym = libc::dlsym(handle.as_ptr(), name.as_ptr());
         if sym.is_null() {
-            Err(errno_to_apperr(libc::ELIBACC))
+            Err(errno_to_apperr(ELIBACC))
         } else {
             Ok(mem::transmute_copy(&sym))
         }
@@ -565,5 +581,5 @@ const fn errno_to_apperr(no: c_int) -> apperr::Error {
 }
 
 fn check_int_return(ret: libc::c_int) -> apperr::Result<libc::c_int> {
-    if ret < 0 { Err(errno_to_apperr(unsafe { *libc::__errno_location() })) } else { Ok(ret) }
+    if ret < 0 { Err(errno_to_apperr(unsafe { *__errno_location() })) } else { Ok(ret) }
 }
