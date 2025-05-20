@@ -6,6 +6,8 @@ This editor pays homage to the classic [MS-DOS Editor](https://en.wikipedia.org/
 
 ![Screenshot of Edit with the About dialog in the foreground](./assets/edit_hero_image.png)
 
+![Screenshot of Vi-Edit with "vi" like status bar](./assets/edit_hero_image_linux.png)
+
 ## Installation
 
 * Download the latest release from our [releases page](https://github.com/microsoft/edit/releases/latest)
