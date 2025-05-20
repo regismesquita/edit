@@ -1,3 +1,6 @@
+Modified to be compatible with MacOS.
+---
+
 # ![Application Icon for Edit](./assets/edit.svg) Edit
 
 A simple editor for simple needs.
