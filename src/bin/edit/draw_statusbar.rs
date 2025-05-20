@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use edit::buffer::ViMode;
 use edit::framebuffer::{Attributes, IndexedColor};
 use edit::helpers::*;
 use edit::input::vk;
@@ -163,10 +164,15 @@ pub fn draw_statusbar(ctx: &mut Context, state: &mut State) {
         // because the vi_mode output will typically be larger than the cursor
         // position output, meaning that the larger vi_mode will visually
         // contain the smaller cursor position.
-        // ctx.label(
-        //     "vi_mode",
-        //     "--insert--"
-        // );
+        let vi_mode_text = if tb.vi_mode == ViMode::Normal {
+            "--normal--"
+        } else {
+            "--insert--"
+        };
+        ctx.label(
+            "vi_mode",
+            vi_mode_text,
+        );
 
         #[cfg(any(feature = "debug-layout", feature = "debug-latency"))]
         ctx.label(
