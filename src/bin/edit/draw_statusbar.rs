@@ -165,9 +165,9 @@ pub fn draw_statusbar(ctx: &mut Context, state: &mut State) {
         // position output, meaning that the larger vi_mode will visually
         // contain the smaller cursor position.
         let vi_mode_text = if tb.vi_mode == ViMode::Normal {
-            "--normal--"
+            "--NORMAL--"
         } else {
-            "--insert--"
+            "--INSERT--"
         };
         ctx.label(
             "vi_mode",
