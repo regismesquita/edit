@@ -1,4 +1,5 @@
 Modified to be compatible with MacOS.
+(Also added vi support from hudson-newey/vi-edit
 ---
 
 # ![Application Icon for Edit](./assets/edit.svg) Edit
