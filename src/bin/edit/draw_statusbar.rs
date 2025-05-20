@@ -153,6 +153,21 @@ pub fn draw_statusbar(ctx: &mut Context, state: &mut State) {
             ),
         );
 
+        // The vi_mode label is added to the end of the status bar's first
+        // container because only the cursor position is not contained within
+        // square brackets [].
+        // By putting the vi_mode next to the cursor position, all of the
+        // non-contained status bar items are grouped together.
+        //
+        // Additionally, I have not positioned it before the cursor position
+        // because the vi_mode output will typically be larger than the cursor
+        // position output, meaning that the larger vi_mode will visually
+        // contain the smaller cursor position.
+        ctx.label(
+            "vi_mode",
+            "--insert--"
+        );
+
         #[cfg(any(feature = "debug-layout", feature = "debug-latency"))]
         ctx.label(
             "stats",
