@@ -9,11 +9,11 @@
 // Compatibility shims for non-Linux platforms
 #[cfg(not(target_os = "linux"))]
 mod compat {
-    use libc::{c_int, pollfd, EACCES};
-    pub use libc::poll as ppoll;
-    pub unsafe fn __errno_location() -> *mut c_int {
+    use libc::{c_int, EACCES};
+    
+    pub unsafe fn __errno_location() -> *mut c_int { unsafe {
         libc::__error()
-    }
+    }}
     pub const ELIBACC: c_int = EACCES;
 }
 
@@ -24,7 +24,7 @@ use std::ffi::{CStr, c_int, c_void};
 use std::fs::{self, File};
 use std::mem::{self, MaybeUninit};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
-use std::ptr::{self, NonNull, null, null_mut};
+use std::ptr::{self, NonNull, null_mut};
 use std::{thread, time};
 
 use crate::arena::{Arena, ArenaString, scratch_arena};
