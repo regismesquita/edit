@@ -66,6 +66,7 @@ static mut STATE: State = State {
     leading_surrogate: 0,
     inject_resize: false,
     wants_exit: false,
+    vi_mode: Vi_Mode.Normal,
 };
 
 extern "system" fn console_ctrl_handler(_ctrl_type: u32) -> Foundation::BOOL {

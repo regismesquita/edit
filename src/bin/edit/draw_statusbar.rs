@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+use edit::buffer::ViMode;
 use edit::framebuffer::{Attributes, IndexedColor};
 use edit::helpers::*;
 use edit::input::vk;
@@ -151,6 +152,26 @@ pub fn draw_statusbar(ctx: &mut Context, state: &mut State) {
                 tb.cursor_logical_pos().y + 1,
                 tb.cursor_logical_pos().x + 1
             ),
+        );
+
+        // The vi_mode label is added to the end of the status bar's first
+        // container because only the cursor position is not contained within
+        // square brackets [].
+        // By putting the vi_mode next to the cursor position, all of the
+        // non-contained status bar items are grouped together.
+        //
+        // Additionally, I have not positioned it before the cursor position
+        // because the vi_mode output will typically be larger than the cursor
+        // position output, meaning that the larger vi_mode will visually
+        // contain the smaller cursor position.
+        let vi_mode_text = if tb.vi_mode == ViMode::Normal {
+            "--NORMAL--"
+        } else {
+            "--INSERT--"
+        };
+        ctx.label(
+            "vi_mode",
+            vi_mode_text,
         );
 
         #[cfg(any(feature = "debug-layout", feature = "debug-latency"))]

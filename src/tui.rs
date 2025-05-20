@@ -150,7 +150,7 @@ use std::fmt::Write as _;
 use std::{iter, mem, ptr, time};
 
 use crate::arena::{Arena, ArenaString, scratch_arena};
-use crate::buffer::{CursorMovement, RcTextBuffer, TextBuffer, TextBufferCell};
+use crate::buffer::{CursorMovement, RcTextBuffer, TextBuffer, TextBufferCell, ViMode};
 use crate::cell::*;
 use crate::document::WriteableDocument;
 use crate::framebuffer::{Attributes, Framebuffer, INDEXED_COLORS_COUNT, IndexedColor};
@@ -2239,12 +2239,12 @@ impl<'a> Context<'a, '_> {
         let mut write: &[u8] = b"";
         let mut write_raw = false;
 
-        if let Some(input) = &self.input_text {
+        if tb.vi_mode == ViMode::Insert && let Some(input) = &self.input_text {
             write = input.text.as_bytes();
             write_raw = input.bracketed;
             tc.preferred_column = tb.cursor_visual_pos().x;
             make_cursor_visible = true;
-        } else if let Some(input) = &self.input_keyboard {
+        } else if tb.vi_mode == ViMode::Insert && let Some(input) = &self.input_keyboard {
             let key = input.key();
             let modifiers = input.modifiers();
 
@@ -2278,6 +2278,8 @@ impl<'a> Context<'a, '_> {
                     write = b"\n";
                 }
                 vk::ESCAPE => {
+                    tb.vi_mode = ViMode::Normal;
+
                     // If there was a selection, clear it and show the cursor (= fallthrough).
                     if !tb.clear_selection() {
                         if single_line {
@@ -2595,6 +2597,119 @@ impl<'a> Context<'a, '_> {
             if !matches!(key, vk::PRIOR | vk::NEXT | vk::UP | vk::DOWN) {
                 tc.preferred_column = tb.cursor_visual_pos().x;
             }
+        } else if tb.vi_mode == ViMode::Normal && let Some(input) = &self.input_keyboard {
+            let key = input.key();
+
+            match key {
+                // character movement
+                vk::H => {
+                    let granularity = CursorMovement::Grapheme;
+                    tb.cursor_move_delta(granularity, -1);
+                }
+                vk::J => {
+                    let mut x = tc.preferred_column;
+                    let mut y = tb.cursor_visual_pos().y + 1;
+
+                    // If there's a selection we put the cursor below it.
+                    if let Some((_, end)) = tb.selection_range() {
+                        x = end.visual_pos.x;
+                        y = end.visual_pos.y + 1;
+                        tc.preferred_column = x;
+                    }
+
+                    // If the cursor was already on the last line,
+                    // move it to the end of the buffer.
+                    if y >= tb.visual_line_count() {
+                        x = CoordType::MAX;
+                    }
+
+                    tb.cursor_move_to_visual(Point { x, y });
+
+                    // If we fell into the `if y >= tb.get_visual_line_count()` above, we wanted to
+                    // update the `preferred_column` but didn't know yet what it was. Now we know!
+                    if x == CoordType::MAX {
+                        tc.preferred_column = tb.cursor_visual_pos().x;
+                    }
+                }
+                vk::K => {
+                        let mut x = tc.preferred_column;
+                        let mut y = tb.cursor_visual_pos().y - 1;
+
+                        // If there's a selection we put the cursor above it.
+                        if let Some((beg, _)) = tb.selection_range() {
+                            x = beg.visual_pos.x;
+                            y = beg.visual_pos.y - 1;
+                            tc.preferred_column = x;
+                        }
+
+                        // If the cursor was already on the first line,
+                        // move it to the start of the buffer.
+                        if y < 0 {
+                            x = 0;
+                            tc.preferred_column = 0;
+                        }
+
+                        tb.cursor_move_to_visual(Point { x, y });
+                }
+                vk::L => {
+                    let granularity = CursorMovement::Grapheme;
+                    tb.cursor_move_delta(granularity, 1);
+                }
+
+                // fast movement
+                vk::W => {
+                    let granularity = CursorMovement::Word;
+                    tb.cursor_move_delta(granularity, 1);
+                }
+                vk::B => {
+                    let granularity = CursorMovement::Word;
+                    tb.cursor_move_delta(granularity, -1);
+                }
+
+                // cursor actions
+                vk::X => {
+                    tb.delete(CursorMovement::Grapheme, 1);
+                }
+
+                // mode changes
+                vk::I => {
+                    tb.vi_mode = ViMode::Insert;
+                }
+                vk::A => {
+                    let granularity = CursorMovement::Grapheme;
+                    tb.cursor_move_delta(granularity, 1);
+
+                    tb.vi_mode = ViMode::Insert;
+                }
+                vk::O => {
+                    let mut x = tc.preferred_column;
+                    let mut y = tb.cursor_visual_pos().y + 1;
+
+                    // If there's a selection we put the cursor below it.
+                    if let Some((_, end)) = tb.selection_range() {
+                        x = end.visual_pos.x;
+                        y = end.visual_pos.y + 1;
+                        tc.preferred_column = x;
+                    }
+
+                    // If the cursor was already on the last line,
+                    // move it to the end of the buffer.
+                    if y >= tb.visual_line_count() {
+                        x = CoordType::MAX;
+                    }
+
+                    tb.cursor_move_to_visual(Point { x, y });
+
+                    // If we fell into the `if y >= tb.get_visual_line_count()` above, we wanted to
+                    // update the `preferred_column` but didn't know yet what it was. Now we know!
+                    if x == CoordType::MAX {
+                        tc.preferred_column = tb.cursor_visual_pos().x;
+                    }
+
+                    tb.vi_mode = ViMode::Insert;
+                }
+                _ => return false,
+            }
         } else {
             return false;
         }
@@ -2603,7 +2718,7 @@ impl<'a> Context<'a, '_> {
             let (end, _) = unicode::newlines_forward(write, 0, 0, 1);
             write = unicode::strip_newline(&write[..end]);
         }
-        if !write.is_empty() {
+        if !write.is_empty() && tb.vi_mode == ViMode::Insert {
             tb.write(write, write_raw);
         }
 

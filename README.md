@@ -9,6 +9,8 @@ This editor pays homage to the classic [MS-DOS Editor](https://en.wikipedia.org/
 
 ![Screenshot of Edit with the About dialog in the foreground](./assets/edit_hero_image.png)
 
+![Screenshot of Vi-Edit with "vi" like status bar](./assets/edit_hero_image_linux.png)
+
 ## Installation
 
 * Download the latest release from our [releases page](https://github.com/microsoft/edit/releases/latest)
@@ -19,7 +21,7 @@ This editor pays homage to the classic [MS-DOS Editor](https://en.wikipedia.org/
 ## Build Instructions
 
 * [Install Rust](https://www.rust-lang.org/tools/install)
-* Install the nightly toolchain: `rustup install nightly`
+* Install and activate the nightly toolchain: `rustup default nightly`
   * Alternatively, set the environment variable `RUSTC_BOOTSTRAP=1`
 * Clone the repository
 * For a release build, run: `cargo build --config .cargo/release.toml --release`
